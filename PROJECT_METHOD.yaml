@@ -1,0 +1,21 @@
+method:
+  name: GPM
+  version: "0.1.0-alpha.1"
+
+profiles:
+  - software-development
+
+project_rules:
+  - AGENTS.md
+
+artifacts:
+  backlog: docs/ACTIVITY_BACKLOG.md
+  handoff: docs/SESSION_HANDOFF.md
+  activity_log: docs/ACTIVITY_LOG.md
+  decisions: docs/decisions.md
+  requirements: docs/REQUIREMENTS.md
+  architecture: docs/ARCHITECTURE.md
+  testing: docs/TESTING.md
+  security: docs/SECURITY.md
+
+adopted_at: "2026-10-13"
