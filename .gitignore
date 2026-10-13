@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+.vscode/
+
+# Private runtime conversation data
+memoria_lucios.txt
+memoria_lucios.json
+
+# Test and tooling caches
+.pytest_cache/
+.mypy_cache/
