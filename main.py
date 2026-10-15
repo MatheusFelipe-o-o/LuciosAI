@@ -1,4 +1,14 @@
+import re
+import sys
+
 from Agent import LuciosAgent
+
+
+def _formatar_para_terminal(texto: str) -> str:
+    """Renderiza negrito Markdown como ANSI em terminais interativos."""
+    if not sys.stdout.isatty():
+        return texto
+    return re.sub(r"\*\*(.+?)\*\*", "\033[1m\\1\033[0m", texto)
 
 if __name__ == "__main__":
     lucios = LuciosAgent()
@@ -17,4 +27,4 @@ if __name__ == "__main__":
             break
 
         response = lucios.chat(user_input)
-        print(f"Lucios: {response}")
+        print(f"Lucios: {_formatar_para_terminal(response)}")
