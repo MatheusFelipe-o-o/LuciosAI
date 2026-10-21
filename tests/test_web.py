@@ -90,6 +90,12 @@ class WebTests(unittest.TestCase):
         self.assertEqual(status, 502)
         self.assertIn("error", data)
 
+    def test_limpar_e_encerrar_validam_e_consumem_json(self):
+        for rota in ("/api/clear", "/api/end"):
+            with self.subTest(rota=rota):
+                self.assertEqual(self.post(rota=rota, bruto="[]")[0], 400)
+                self.assertEqual(self.post(rota=rota, bruto="")[0], 200)
+
 
 if __name__ == "__main__":
     unittest.main()

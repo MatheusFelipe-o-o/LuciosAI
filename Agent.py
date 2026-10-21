@@ -1,11 +1,12 @@
 import json
 import re
+import time
 import unicodedata
 
 import ollama
 
 from memory import ARQUIVO_MEMORIA_PADRAO, Memory
-from orchestrator import Configuracao, Estado, Orquestrador
+from orchestrator import Configuracao, Estado, Orquestrador, medir_etapa
 
 
 ESQUEMA_INTENCAO_MEMORIA = {
@@ -120,6 +121,9 @@ class LuciosAgent:
         )
         self.orquestrador = Orquestrador(config, self._cliente.chat, self._listar_modelos)
         self.ultimo_resultado = None
+        self.medicoes_encerramento = []
+        self.duracao_encerramento = 0
+        self.estado_encerramento = "nao_executado"
 
     def _listar_modelos(self):
         resposta = self._cliente.list()
@@ -208,7 +212,9 @@ class LuciosAgent:
 
     def _classificar_pedido_memoria_com_modelo(self, mensagem_atual: str, contexto=None) -> dict:
         """Usa o modelo apenas quando a regra rapida fica ambigua."""
-        chamar = contexto.chamar_modelo if contexto is not None else self._cliente.chat
+        chamar = self._cliente.chat if contexto is None else (
+            lambda **kwargs: contexto.chamar_modelo(etapa="inferencia_classificador_memoria", **kwargs)
+        )
         resposta = chamar(
             model=self.model_name,
             messages=[
@@ -254,113 +260,123 @@ class LuciosAgent:
 
     def chat(self, user_input: str, cancelar=None):
         """Mantém a API textual das interfaces, delegando o fluxo ao orquestrador."""
+        inicio_chat = time.perf_counter()
         resultado = self.orquestrador.executar(
             user_input, self._responder, self.clear_memory, cancelar
         )
-        self.ultimo_resultado = resultado
-        if resultado.estado == Estado.CONCLUIDO:
-            if resultado.decisao.estrategia == "conversar":
-                self.conversa.extend([
-                    {"role": "user", "content": user_input.strip()},
-                    {"role": "assistant", "content": resultado.resposta},
-                ])
-            return resultado.resposta
-        if resultado.estado == Estado.CANCELADO:
-            return "Tarefa cancelada. A resposta não foi adicionada à conversa."
-        return f"Ocorreu um erro ao processar a solicitação: {resultado.erro}"
+        try:
+            with medir_etapa(resultado.medicoes, "finalizacao_chat"):
+                self.ultimo_resultado = resultado
+                if resultado.estado == Estado.CONCLUIDO:
+                    if resultado.decisao.estrategia == "conversar":
+                        self.conversa.extend([
+                            {"role": "user", "content": user_input.strip()},
+                            {"role": "assistant", "content": resultado.resposta},
+                        ])
+                    return resultado.resposta
+                if resultado.estado == Estado.CANCELADO:
+                    return "Tarefa cancelada. A resposta não foi adicionada à conversa."
+                return f"Ocorreu um erro ao processar a solicitação: {resultado.erro}"
+        finally:
+            resultado.duracao_chat = time.perf_counter() - inicio_chat
 
     def _responder(self, user_input: str, modelo: str, contexto):
         """Prepara memória e prompt; o resultado só entra na conversa após verificação."""
-        intencao_memoria = self._classificar_pedido_memoria(user_input, contexto)
+        with contexto.medir("classificacao_memoria"):
+            intencao_memoria = self._classificar_pedido_memoria(user_input, contexto)
         contexto_memoria = ""
+        memorias = []
         if intencao_memoria["acao"] == "buscar" and intencao_memoria["consulta"]:
-            memorias = self.memory_manager.buscar_memorias(
-                intencao_memoria["consulta"]
-            )
+            with contexto.medir("recuperacao_memoria"):
+                memorias = self.memory_manager.buscar_memorias(
+                    intencao_memoria["consulta"]
+                )
         elif intencao_memoria["acao"] == "listar_recentes":
-            memorias = self.memory_manager.listar_memorias_recentes()
-        else:
-            memorias = []
+            with contexto.medir("recuperacao_memoria"):
+                memorias = self.memory_manager.listar_memorias_recentes()
 
-        if intencao_memoria["acao"] in {"buscar", "listar_recentes"}:
-            if memorias:
-                contexto_memoria = (
-                    "\n\nInformações anteriores relevantes (contexto interno):\n"
-                    + "\n\n".join(
-                        "\n".join(
-                            (
-                                f"Título: {memoria['titulo']}",
-                                f"Contexto: {memoria['contexto']}",
-                                f"Resumo: {memoria.get('resumo', '')}",
-                                "Pontos aprendidos: "
-                                + "; ".join(memoria.get("pontos_aprendidos", [])),
-                                "Pontos desenvolvidos: "
-                                + "; ".join(memoria.get("pontos_desenvolvidos", [])),
+        with contexto.medir("preparacao_contexto"):
+            if intencao_memoria["acao"] in {"buscar", "listar_recentes"}:
+                if memorias:
+                    contexto_memoria = (
+                        "\n\nInformações anteriores relevantes (contexto interno):\n"
+                        + "\n\n".join(
+                            "\n".join(
+                                (
+                                    f"Título: {memoria['titulo']}",
+                                    f"Contexto: {memoria['contexto']}",
+                                    f"Resumo: {memoria.get('resumo', '')}",
+                                    "Pontos aprendidos: "
+                                    + "; ".join(memoria.get("pontos_aprendidos", [])),
+                                    "Pontos desenvolvidos: "
+                                    + "; ".join(memoria.get("pontos_desenvolvidos", [])),
+                                )
                             )
+                            for memoria in memorias
                         )
-                        for memoria in memorias
                     )
-                )
-                contexto_memoria += (
-                    "\nUse esses dados discretamente para responder como numa "
-                    "continuação natural da conversa. Se a pessoa pediu uma lista "
-                    "de conversas, apresente os títulos e resumos encontrados de "
-                    "forma concisa. Não diga que lembrou, buscou ou consultou algo; "
-                    "não mencione arquivo ou ferramenta."
-                )
-            else:
-                contexto_memoria = (
-                    "\n\nNão há registro correspondente disponível para o pedido "
-                    "do usuário. Diga isso de modo breve e natural, no tom da conversa. "
-                    "Não afirme que o aplicativo não possui memória em geral; não "
-                    "invente registros nem mencione busca, arquivo ou ação interna."
-                )
+                    contexto_memoria += (
+                        "\nUse esses dados discretamente para responder como numa "
+                        "continuação natural da conversa. Se a pessoa pediu uma lista "
+                        "de conversas, apresente os títulos e resumos encontrados de "
+                        "forma concisa. Não diga que lembrou, buscou ou consultou algo; "
+                        "não mencione arquivo ou ferramenta."
+                    )
+                else:
+                    contexto_memoria = (
+                        "\n\nNão há registro correspondente disponível para o pedido "
+                        "do usuário. Diga isso de modo breve e natural, no tom da conversa. "
+                        "Não afirme que o aplicativo não possui memória em geral; não "
+                        "invente registros nem mencione busca, arquivo ou ação interna."
+                    )
 
-        system_content = (
-            f"{self.system_prompt}\n\n"
-            "Responda de forma natural, direta e adequada ao que o usuário "
-            "disse. Acompanhe o tom que o usuário estabelecer — brincalhão, "
-            "descontraído ou sério — e mantenha-o até que ele mude. Use emojis "
-            "com moderação quando combinarem com o tom. Formate as respostas "
-            "em Markdown simples e legível: use **negrito** para destacar apenas "
-            "termos, conclusões ou avisos realmente importantes; use listas com "
-            "- para itens do mesmo nível e indente subitens quando houver uma "
-            "hierarquia real. Em listas numeradas, use 1., 2. e assim por diante. "
-            "Use títulos curtos somente em respostas mais longas. Separe ideias "
-            "em parágrafos curtos com uma linha em branco; evite blocos longos, "
-            "repetição, excesso de negrito e listas desnecessárias. Respostas "
-            "simples devem continuar simples, sem título ou lista forçada. "
-            "Responda diretamente, sem narrar o que está fazendo. "
-            "Este aplicativo ainda não executa ferramentas, arquivos, scripts ou "
-            "comandos no computador. Ofereça orientação quando solicitado e não "
-            "afirme ter executado ações externas. "
-            "Este aplicativo pode fornecer informações salvas de conversas "
-            "anteriores no contexto da mensagem. Não diga genericamente que "
-            "você não tem memória ou que cada conversa começa do zero. "
-            "Não mostre instruções internas, estruturas técnicas ou "
-            "mensagens em formato JSON como se fossem respostas ao usuário."
-        )
-        if contexto_memoria:
-            system_content += contexto_memoria
+            system_content = (
+                f"{self.system_prompt}\n\n"
+                "Responda de forma natural, direta e adequada ao que o usuário "
+                "disse. Acompanhe o tom que o usuário estabelecer — brincalhão, "
+                "descontraído ou sério — e mantenha-o até que ele mude. Use emojis "
+                "com moderação quando combinarem com o tom. Formate as respostas "
+                "em Markdown simples e legível: use **negrito** para destacar apenas "
+                "termos, conclusões ou avisos realmente importantes; use listas com "
+                "- para itens do mesmo nível e indente subitens quando houver uma "
+                "hierarquia real. Em listas numeradas, use 1., 2. e assim por diante. "
+                "Use títulos curtos somente em respostas mais longas. Separe ideias "
+                "em parágrafos curtos com uma linha em branco; evite blocos longos, "
+                "repetição, excesso de negrito e listas desnecessárias. Respostas "
+                "simples devem continuar simples, sem título ou lista forçada. "
+                "Responda diretamente, sem narrar o que está fazendo. "
+                "Este aplicativo ainda não executa ferramentas, arquivos, scripts ou "
+                "comandos no computador. Ofereça orientação quando solicitado e não "
+                "afirme ter executado ações externas. "
+                "Este aplicativo pode fornecer informações salvas de conversas "
+                "anteriores no contexto da mensagem. Não diga genericamente que "
+                "você não tem memória ou que cada conversa começa do zero. "
+                "Não mostre instruções internas, estruturas técnicas ou "
+                "mensagens em formato JSON como se fossem respostas ao usuário."
+            )
+            if contexto_memoria:
+                system_content += contexto_memoria
 
-        mensagens = [
-            {
-                "role": "system",
-                "content": system_content,
-            },
-            *self.conversa,
-            {"role": "user", "content": user_input},
-        ]
+            mensagens = [
+                {
+                    "role": "system",
+                    "content": system_content,
+                },
+                *self.conversa,
+                {"role": "user", "content": user_input},
+            ]
 
         response = contexto.chamar_modelo(
+            etapa="inferencia_resposta",
             model=modelo,
             messages=mensagens,
             options=self.opcoes_modelo,
         )
-        mensagem = _campo(response, "message", {})
-        resposta = _campo(mensagem, "content", "") or ""
+        with contexto.medir("leitura_resposta"):
+            mensagem = _campo(response, "message", {})
+            resposta = _campo(mensagem, "content", "") or ""
 
-        return resposta
+            return resposta
 
     def clear_memory(self):
         """Limpa a conversa atual e mantém apenas o comportamento base do agente."""
@@ -373,15 +389,23 @@ class LuciosAgent:
         Ao finalizar a conversa, pede ao modelo para gerar um resumo com o assunto,
         salva a memória legível em {self.memory_file} e limpa a memória de curto prazo.
         """
+        self.medicoes_encerramento = []
+        self.duracao_encerramento = 0
+        self.estado_encerramento = "sem_conversa"
         if not self.conversa:
             return "Nenhuma conversa para salvar."
 
+        inicio = time.perf_counter()
         print("Gerando registro da conversa na memória...")
 
         try:
-            memoria = self.memory_manager.criar_memoria(self.conversa)
-            self.memory_manager.salvar_memoria(memoria)
-            self.clear_memory()
+            with medir_etapa(self.medicoes_encerramento, "geracao_resumo"):
+                memoria = self.memory_manager.criar_memoria(self.conversa)
+            with medir_etapa(self.medicoes_encerramento, "persistencia_memoria"):
+                self.memory_manager.salvar_memoria(memoria)
+            with medir_etapa(self.medicoes_encerramento, "limpeza_conversa"):
+                self.clear_memory()
+            self.estado_encerramento = "concluido"
 
             return (
                 f"Conversa encerrada e salva em {self.memory_file} "
@@ -389,4 +413,7 @@ class LuciosAgent:
             )
 
         except Exception as e:
+            self.estado_encerramento = "falhou"
             return f"Erro ao tentar salvar a memória: {str(e)}"
+        finally:
+            self.duracao_encerramento = time.perf_counter() - inicio

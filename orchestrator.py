@@ -1,6 +1,7 @@
 """Fluxo finito de tarefas. Não executa código, comandos ou ferramentas externas."""
 
 from dataclasses import dataclass, field, replace
+from contextlib import contextmanager
 from enum import Enum
 import math
 import os
@@ -66,6 +67,43 @@ class Decisao:
 
 
 @dataclass
+class Medicao:
+    etapa: str
+    duracao: float = 0
+    sucesso: bool = False
+    subetapas: list["Medicao"] = field(default_factory=list)
+    metricas: dict[str, float | int] = field(default_factory=dict)
+
+    @property
+    def exclusiva(self):
+        """Tempo próprio, descontando somente filhos imediatos."""
+        return max(0, self.duracao - sum(filho.duracao for filho in self.subetapas))
+
+
+@contextmanager
+def medir_etapa(medicoes, nome, relogio=time.perf_counter):
+    medicao = Medicao(nome)
+    medicoes.append(medicao)
+    inicio = relogio()
+    try:
+        yield medicao
+        medicao.sucesso = True
+    finally:
+        medicao.duracao = max(0, relogio() - inicio)
+
+
+def _metricas_ollama(resposta):
+    """Captura apenas contadores numéricos permitidos, nunca conteúdo do modelo."""
+    metricas = {}
+    for nome in ("total_duration", "load_duration", "prompt_eval_duration",
+                 "eval_duration", "prompt_eval_count", "eval_count"):
+        valor = resposta.get(nome) if isinstance(resposta, dict) else getattr(resposta, nome, None)
+        if type(valor) in (int, float) and math.isfinite(valor) and valor >= 0:
+            metricas[nome] = valor
+    return metricas
+
+
+@dataclass
 class Resultado:
     estados: list[Estado] = field(default_factory=lambda: [Estado.RECEBIDO])
     decisao: Decisao | None = None
@@ -73,6 +111,8 @@ class Resultado:
     erro: str | None = None
     chamadas_modelo: int = 0
     duracao: float = 0
+    duracao_chat: float = 0
+    medicoes: list[Medicao] = field(default_factory=list)
 
     @property
     def estado(self):
@@ -102,6 +142,17 @@ class ContextoExecucao:
         self._cancelar = cancelar
         self._relogio = relogio
         self.inicio = relogio()
+        self._pilha_medicoes = []
+
+    @contextmanager
+    def medir(self, nome):
+        destino = self._pilha_medicoes[-1].subetapas if self._pilha_medicoes else self.resultado.medicoes
+        with medir_etapa(destino, nome, self._relogio) as medicao:
+            self._pilha_medicoes.append(medicao)
+            try:
+                yield medicao
+            finally:
+                self._pilha_medicoes.pop()
 
     def verificar_limites(self):
         if self._cancelar is not None and self._cancelar.is_set():
@@ -109,13 +160,15 @@ class ContextoExecucao:
         if self._relogio() - self.inicio >= self.config.timeout:
             raise TimeoutError("A tarefa excedeu o orçamento de tempo.")
 
-    def chamar_modelo(self, **parametros):
+    def chamar_modelo(self, etapa="inferencia", **parametros):
         self.verificar_limites()
         if self.resultado.chamadas_modelo >= self.config.limite_chamadas:
             raise RuntimeError("Limite de chamadas ao modelo atingido.")
         self.resultado.chamadas_modelo += 1
-        resposta = self._chamar_modelo(**parametros)
-        self.verificar_limites()
+        with self.medir(etapa) as medicao:
+            resposta = self._chamar_modelo(**parametros)
+            medicao.metricas = _metricas_ollama(resposta)
+            self.verificar_limites()
         return resposta
 
 
@@ -132,7 +185,7 @@ def _nome_modelo(nome):
 
 class Orquestrador:
     def __init__(self, config: Configuracao, chamar_modelo: Callable,
-                 listar_modelos: Callable, relogio: Callable = time.monotonic):
+                 listar_modelos: Callable, relogio: Callable = time.perf_counter):
         self.config = config
         self._chamar_modelo = chamar_modelo
         self._listar_modelos = listar_modelos
@@ -158,7 +211,8 @@ class Orquestrador:
             return decisao
         contexto.verificar_limites()
         try:
-            disponiveis = {_nome_modelo(nome) for nome in self._listar_modelos()}
+            with contexto.medir("catalogo_modelos"):
+                disponiveis = {_nome_modelo(nome) for nome in self._listar_modelos()}
         except Exception:
             contexto.verificar_limites()
             return replace(decisao, motivo="Fallback: catálogo local indisponível.")
@@ -175,23 +229,31 @@ class Orquestrador:
                                    cancelar, self._relogio)
         resultado.transicionar(Estado.VALIDANDO)
         try:
-            contexto.verificar_limites()
-            if not isinstance(pedido, str) or not pedido.strip():
-                raise ValueError("A mensagem deve ser um texto não vazio.")
-            if len(pedido) > self.config.limite_entrada:
-                raise ValueError(f"Mensagem excede {self.config.limite_entrada} caracteres.")
-            texto = pedido.strip()
-            resultado.decisao = self._selecionar_modelo(self.classificar(texto), contexto)
+            with contexto.medir("validacao"):
+                contexto.verificar_limites()
+                if not isinstance(pedido, str) or not pedido.strip():
+                    raise ValueError("A mensagem deve ser um texto não vazio.")
+                if len(pedido) > self.config.limite_entrada:
+                    raise ValueError(f"Mensagem excede {self.config.limite_entrada} caracteres.")
+                texto = pedido.strip()
+            with contexto.medir("classificacao_tarefa"):
+                decisao = self.classificar(texto)
+            with contexto.medir("selecao_modelo"):
+                resultado.decisao = self._selecionar_modelo(decisao, contexto)
             contexto.verificar_limites()
             resultado.transicionar(Estado.EXECUTANDO)
-            resposta = limpar() if resultado.decisao.estrategia == "limpar" else responder(
-                texto, resultado.decisao.modelo, contexto
-            )
+            with contexto.medir("execucao"):
+                if resultado.decisao.estrategia == "limpar":
+                    with contexto.medir("limpeza_conversa"):
+                        resposta = limpar()
+                else:
+                    resposta = responder(texto, resultado.decisao.modelo, contexto)
             resultado.transicionar(Estado.VERIFICANDO)
-            contexto.verificar_limites()
-            if not isinstance(resposta, str) or not resposta.strip():
-                raise ValueError("O modelo ou a operação não retornou uma resposta textual válida.")
-            resultado.resposta = resposta
+            with contexto.medir("verificacao"):
+                contexto.verificar_limites()
+                if not isinstance(resposta, str) or not resposta.strip():
+                    raise ValueError("O modelo ou a operação não retornou uma resposta textual válida.")
+                resultado.resposta = resposta
             resultado.transicionar(Estado.CONCLUIDO)
         except ExecucaoCancelada as erro:
             resultado.erro = str(erro)

@@ -662,13 +662,14 @@ class LuciosWebHandler(BaseHTTPRequestHandler):
         self.send_json({"error": "Rota nao encontrada."}, status=404)
 
     def do_POST(self):
-        if self.path == "/api/chat":
+        if self.path in ("/api/chat", "/api/clear", "/api/end"):
             try:
-                payload = self.read_json()
+                payload = self.read_json() if self.headers.get("Content-Length", "0") != "0" else {}
             except (ValueError, UnicodeDecodeError):
                 self.send_json({"error": "Envie um objeto JSON válido de até 64 KiB."}, status=400)
                 return
 
+        if self.path == "/api/chat":
             message = payload.get("message", "")
             if not isinstance(message, str) or not message.strip() or len(message) > agent.configuracao.limite_entrada:
                 self.send_json({"error": "Mensagem inválida ou acima do limite de tamanho."}, status=400)

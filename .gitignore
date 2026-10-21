@@ -17,3 +17,6 @@ memoria_lucios.json
 # Test and tooling caches
 .pytest_cache/
 .mypy_cache/
+
+# Local benchmark results (timings and runtime metadata)
+benchmark_results/
