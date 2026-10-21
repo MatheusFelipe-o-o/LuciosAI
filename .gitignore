@@ -13,6 +13,7 @@ venv/
 # Private runtime conversation data
 memoria_lucios.txt
 memoria_lucios.json
+local_data/
 
 # Test and tooling caches
 .pytest_cache/

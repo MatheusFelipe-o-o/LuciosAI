@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="lucios-token" content="__TOKEN__">
+<meta name="description" content="Seu espaço de conversa com o LuciosAI. Contexto, ideias e desempenho em um só lugar.">
+<title>LuciosAI · Conversas</title>
+<link rel="stylesheet" href="/app.css">
+<script src="/markdown.js" defer></script>
+<script src="/app.js" defer></script>
+</head>
+<body>
+<svg class="svg-library" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><defs>
+<symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+<symbol id="i-panel" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M9 4v16"/></symbol>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4 4"/></symbol>
+<symbol id="i-chat" viewBox="0 0 24 24"><path d="M21 11a8 8 0 0 1-8 8H6l-4 3V11a9 9 0 0 1 19 0Z"/><path d="M7 10h10M7 14h6"/></symbol>
+<symbol id="i-lab" viewBox="0 0 24 24"><path d="M3 18V6m0 12h18M6 14l4-5 4 3 6-8"/></symbol>
+<symbol id="i-arrow" viewBox="0 0 24 24"><path d="M12 19V5m-6 6 6-6 6 6"/></symbol>
+<symbol id="i-save" viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z"/><path d="M7 3v6h10V4M7 21v-8h10v8"/></symbol>
+<symbol id="i-code" viewBox="0 0 24 24"><path d="m8 7-5 5 5 5m8-10 5 5-5 5m-3-14-2 18"/></symbol>
+<symbol id="i-spark" viewBox="0 0 24 24"><path d="m12 3 2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5Z"/></symbol>
+<symbol id="i-out" viewBox="0 0 24 24"><path d="M14 4h6v6m0-6L10 14m-1-9H5a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4"/></symbol>
+</defs></svg>
+<button class="scrim" id="scrim" aria-label="Fechar menu" tabindex="-1" hidden></button>
+<aside class="sidebar" id="sidebar" aria-label="Navegação principal">
+  <div class="brand"><a href="/" aria-label="LuciosAI, início"><span class="logo">L</span><span>Lucios<span class="brand-ai">AI</span></span></a><button class="icon-button" id="closeSidebar" aria-label="Recolher menu" aria-expanded="true" aria-controls="sidebar"><svg><use href="#i-panel"/></svg></button></div>
+  <button class="new-chat" id="newBtn"><svg><use href="#i-plus"/></svg> Novo chat <kbd>Alt N</kbd></button>
+  <div class="section-label">FUNCIONALIDADES</div>
+  <nav class="tools"><button class="nav-item active" id="chatNav"><svg><use href="#i-chat"/></svg>Conversas<span class="tiny-dot"></span></button><button class="nav-item" id="labBtn"><svg><use href="#i-lab"/></svg><span>Performance Lab<small>Benchmark e hardware</small></span><svg class="out"><use href="#i-out"/></svg></button></nav>
+  <div class="recent-head"><span class="section-label">RECENTES</span><span class="count" id="recentCount">0</span></div>
+  <label class="search"><svg><use href="#i-search"/></svg><input id="search" type="search" placeholder="Buscar conversa" aria-label="Buscar nas conversas recentes"></label>
+  <nav id="recentList" class="recent-list" aria-label="Conversas recentes"><p class="list-empty">Carregando conversas…</p></nav>
+  <div class="sidebar-bottom"><span class="local-icon">L</span><div><strong>Seu espaço local</strong><small>Histórico neste computador</small></div><span class="tiny-dot"></span></div>
+</aside>
+<main class="workspace" id="workspace">
+  <header class="topbar"><div class="top-left"><button class="icon-button" id="menuBtn" aria-label="Abrir menu" aria-expanded="false" aria-controls="sidebar"><svg><use href="#i-panel"/></svg></button><div class="breadcrumb">Workspace <span>/</span> <strong id="chatTitle">Nova conversa</strong></div></div><div class="top-actions"><span class="local-pill"><i></i> LOCAL</span><button class="save-button" id="endBtn" disabled><svg><use href="#i-save"/></svg><span>Salvar na memória</span></button></div></header>
+  <section class="chat-area" id="chatArea" aria-label="Conversa com LuciosAI">
+    <div class="welcome" id="welcome"><div class="welcome-badge"><svg><use href="#i-spark"/></svg> SEU ASSISTENTE, NO SEU RITMO</div><div class="hero-mark" aria-hidden="true">L<span></span></div><h1>Uma ideia.<br><span>Novas possibilidades.</span></h1><p>Converse, desenvolva e encontre o próximo passo.<br>O Lucios está pronto para pensar com você.</p><div class="suggestions"><button class="suggestion" data-prompt="Me ajude a organizar as etapas do meu projeto."><svg><use href="#i-chat"/></svg><strong>Organizar uma ideia</strong><span>Do primeiro passo ao plano de ação</span></button><button class="suggestion" data-prompt="Quero entender melhor um código. Pode me ajudar a analisar?"><svg><use href="#i-code"/></svg><strong>Pensar em código</strong><span>Entenda a lógica, explore soluções</span></button><button class="suggestion lab-entry" id="labCard"><svg><use href="#i-lab"/></svg><strong>Explorar o desempenho <span>↗</span></strong><span>CPU, GPU e benchmark em tempo real</span></button></div></div>
+    <div class="messages" id="messages" role="log" aria-label="Mensagens" aria-live="polite" aria-relevant="additions"></div>
+  </section>
+  <div class="composer-area"><div class="activity" id="activity" role="status"><span class="activity-dot"></span><span id="status">Pronto para conversar</span><span id="model" class="model-label">Modelo local</span></div><form id="chatForm" class="composer"><label class="sr-only" for="prompt">Sua mensagem</label><textarea id="prompt" placeholder="O que vamos construir hoje?" rows="1" maxlength="16000"></textarea><div class="composer-bottom"><span><span class="composer-symbol">✳</span> LuciosAI <span class="composer-mode">/ Conversa</span></span><button id="sendBtn" class="send" aria-label="Enviar mensagem" type="submit"><svg><use href="#i-arrow"/></svg></button></div></form><div class="composer-note"><span>Enter para enviar <span class="note-divider">·</span> Shift + Enter para nova linha</span><span>Confira informações importantes.</span></div></div>
+</main>
+<div class="toast" id="toast" role="status" hidden></div>
+</body>
+</html>
