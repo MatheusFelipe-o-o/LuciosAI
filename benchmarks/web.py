@@ -1,4 +1,4 @@
-"""Painel local de benchmark: python benchmark_web.py e abra 127.0.0.1:8001."""
+"""Painel local de benchmark: python -m benchmarks.web e abra 127.0.0.1:8001."""
 
 import argparse
 from collections import deque
@@ -13,9 +13,9 @@ from urllib.parse import urlsplit
 
 import ollama
 
-from benchmark import CENARIOS, executar_benchmark, salvar_relatorios
-from benchmark_score import pontuar
-from hardware_monitor import ColetorHardware, resumir_hardware
+from .runner import CENARIOS, executar_benchmark, salvar_relatorios
+from .score import pontuar
+from .hardware import ColetorHardware, resumir_hardware
 from orchestrator import Configuracao, observar_medicoes
 
 
@@ -215,7 +215,7 @@ class BenchmarkHandler(BaseHTTPRequestHandler):
             return
         rota = urlsplit(self.path).path
         if rota == "/":
-            html = Path(__file__).with_name("benchmark_ui.html").read_text(encoding="utf-8")
+            html = Path(__file__).with_name("dashboard.html").read_text(encoding="utf-8")
             self.enviar(html.replace("__TOKEN__", self.server.token).encode(), tipo="text/html; charset=utf-8")
         elif rota == "/api/state":
             self.enviar(self.server.painel.snapshot())

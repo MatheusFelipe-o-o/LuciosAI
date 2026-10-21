@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from Agent import LuciosAgent
-from benchmark import (CENARIOS, achatar_medicoes, executar_amostra, executar_benchmark,
+from benchmarks.runner import (CENARIOS, achatar_medicoes, executar_amostra, executar_benchmark,
                        estatisticas, main, salvar_relatorios)
 from orchestrator import Configuracao, Medicao
 
@@ -40,7 +40,7 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(relatorio["resumos"][0]["sucessos"], 0)
 
     def test_memoria_temporaria_independente_do_diretorio_atual(self):
-        with patch("benchmark.LuciosAgent", wraps=LuciosAgent) as agent:
+        with patch("benchmarks.runner.LuciosAgent", wraps=LuciosAgent) as agent:
             executar_amostra(Configuracao(), "memoria_busca", True)
         memoria = Path(agent.call_args.kwargs["memory_file"])
         self.assertTrue(memoria.is_absolute())

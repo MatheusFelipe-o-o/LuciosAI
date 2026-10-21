@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock
 
-from hardware_monitor import ColetorHardware, ler_gpus, resumir_hardware
+from benchmarks.hardware import ColetorHardware, ler_gpus, resumir_hardware
 
 
 class HardwareTests(unittest.TestCase):

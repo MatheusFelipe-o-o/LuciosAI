@@ -2,7 +2,7 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Event
 import unittest
 
-from benchmark import executar_benchmark
+from benchmarks.runner import executar_benchmark
 from orchestrator import Configuracao, medir_etapa, observar_medicoes
 
 

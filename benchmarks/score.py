@@ -5,7 +5,7 @@ import hashlib
 import json
 import statistics
 
-from benchmark import CENARIOS
+from .runner import CENARIOS
 
 
 REFERENCIAS = {"limpeza": 0.001, "conversa": 2, "memoria_busca": 2.5,

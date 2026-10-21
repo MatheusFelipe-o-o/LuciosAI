@@ -2,7 +2,7 @@
 const assert=require('node:assert/strict');
 const fs=require('node:fs');
 const vm=require('node:vm');
-const html=fs.readFileSync('benchmark_ui.html','utf8');
+const html=fs.readFileSync('dashboard.html','utf8');
 const script=html.match(/<script>([\s\S]*?)<\/script>/)[1];
 const elements=new Map();
 let lineCount=0;

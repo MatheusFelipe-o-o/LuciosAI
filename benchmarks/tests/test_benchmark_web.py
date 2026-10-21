@@ -6,9 +6,9 @@ from tempfile import TemporaryDirectory
 from threading import Event, Thread
 import unittest
 
-from benchmark import executar_benchmark
-from benchmark_score import pontuar
-from benchmark_web import PainelBenchmark, criar_servidor, validar_opcoes
+from benchmarks.runner import executar_benchmark
+from benchmarks.score import pontuar
+from benchmarks.web import PainelBenchmark, criar_servidor, validar_opcoes
 from orchestrator import Configuracao
 
 
@@ -102,6 +102,10 @@ class PainelTests(unittest.TestCase):
                     finally:
                         conn.close()
                 self.assertEqual(request("POST", "/api/start", token=False)[0], 403)
+                status, html = request("GET", "/")
+                self.assertEqual(status, 200)
+                self.assertIn(b"Performance Lab", html)
+                self.assertNotIn(b"__TOKEN__", html)
                 payload = {"simulado": True, "cenarios": ["limpeza"], "repeticoes": 1, "aquecimentos": 0}
                 self.assertEqual(request("POST", "/api/start", payload)[0], 200)
                 painel.worker.join(timeout=4)
