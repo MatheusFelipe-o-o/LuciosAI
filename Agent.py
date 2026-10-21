@@ -1,4 +1,6 @@
 import json
+import re
+import unicodedata
 
 import ollama
 
@@ -24,6 +26,55 @@ def _campo(objeto, nome, padrao=None):
     return getattr(objeto, nome, padrao)
 
 
+def _normalizar_texto(texto: str) -> str:
+    texto = unicodedata.normalize("NFKD", texto.casefold())
+    texto = "".join(caractere for caractere in texto if not unicodedata.combining(caractere))
+    return re.sub(r"\s+", " ", texto).strip()
+
+
+def _limpar_consulta_memoria(texto: str) -> str:
+    consulta = _normalizar_texto(texto)
+    consulta = re.sub(
+        r"\b(voce|vc|tu|lucios)?\s*"
+        r"(lembra|lembre|relembra|relembre|recorda|recorde|recupera|recupere|retoma|retome)"
+        r"\s*(de|do|da|dos|das|sobre|o|a|os|as|que)?\b",
+        " ",
+        consulta,
+    )
+    consulta = re.sub(
+        r"\b(o que|do que|daquilo que)?\s*"
+        r"(a gente|nos|eu e voce|eu e vc)\s*"
+        r"(falou|conversou|tratou|discutiu)\s*(sobre|de)?\b",
+        " ",
+        consulta,
+    )
+    return re.sub(r"\s+", " ", consulta).strip()
+
+
+def _parece_falar_de_memoria(texto: str) -> bool:
+    sinais = (
+        "memoria",
+        "lembra",
+        "lembre",
+        "recorda",
+        "recorde",
+        "salvo",
+        "salva",
+        "salvei",
+        "guardado",
+        "guardada",
+        "historico",
+        "conversa anterior",
+        "conversa passada",
+        "conversas",
+        "falamos",
+        "a gente falou",
+        "voce sabe sobre mim",
+        "sabe de mim",
+    )
+    return any(sinal in texto for sinal in sinais)
+
+
 class LuciosAgent:
     def __init__(
         self,
@@ -47,6 +98,14 @@ class LuciosAgent:
         self.memory_manager = Memory(model_name, memory_file)
         self.conversa = []
         self.memory = [{"role": "system", "content": system_prompt}]
+        self.opcoes_modelo = {
+            "num_ctx": 4096,
+        }
+        self.opcoes_classificador = {
+            "temperature": 0,
+            "num_ctx": 512,
+            "num_predict": 80,
+        }
 
     def add_message(self, role, content):
         """Adiciona uma nova entrada à memória do agente."""
@@ -57,6 +116,76 @@ class LuciosAgent:
         if not mensagem_atual:
             return {"acao": "nenhuma", "consulta": ""}
 
+        texto = _normalizar_texto(mensagem_atual)
+
+        pedidos_lista = (
+            "ultimas conversas",
+            "conversas recentes",
+            "conversas anteriores",
+            "memorias recentes",
+            "listar memorias",
+            "lista de memorias",
+            "liste memorias",
+            "liste memoria",
+            "listar memoria",
+            "mostrar memoria",
+            "mostre memoria",
+            "exibir memoria",
+            "exiba memoria",
+            "o que tem na memoria",
+            "oque tem na memoria",
+            "ver memoria",
+            "minha memoria",
+            "memoria salva",
+            "historico recente",
+        )
+        if any(pedido in texto for pedido in pedidos_lista):
+            return {"acao": "listar_recentes", "consulta": ""}
+
+        gatilhos_busca = (
+            "lembra",
+            "lembre",
+            "relembra",
+            "relembre",
+            "recorda",
+            "recorde",
+            "recupera",
+            "recupere",
+            "retoma",
+            "retome",
+            "continuar aquele assunto",
+            "continua aquele assunto",
+            "o que a gente falou",
+            "do que a gente falou",
+            "o que nos falamos",
+            "do que nos falamos",
+            "conversa passada",
+            "conversa anterior",
+        )
+        if not any(gatilho in texto for gatilho in gatilhos_busca):
+            if any(sinal in texto for sinal in ("salvo", "salva", "salvei", "guardado", "guardada")):
+                consulta = re.sub(
+                    r"\b(tem|existe|ha|alguma?|algo|coisa|informacao|salvo|salva|salvei|guardado|guardada|sobre|mim|comigo|voce|vc|lucios)\b",
+                    " ",
+                    texto,
+                )
+                consulta = re.sub(r"[^\w\s]", " ", consulta)
+                consulta = re.sub(r"\s+", " ", consulta).strip()
+                if consulta:
+                    return {"acao": "buscar", "consulta": consulta}
+                return {"acao": "listar_recentes", "consulta": ""}
+
+            if _parece_falar_de_memoria(texto):
+                return self._classificar_pedido_memoria_com_modelo(mensagem_atual)
+            return {"acao": "nenhuma", "consulta": ""}
+
+        consulta = _limpar_consulta_memoria(mensagem_atual)
+        if not consulta:
+            return {"acao": "listar_recentes", "consulta": ""}
+        return {"acao": "buscar", "consulta": consulta}
+
+    def _classificar_pedido_memoria_com_modelo(self, mensagem_atual: str) -> dict:
+        """Usa o modelo apenas quando a regra rapida fica ambigua."""
         resposta = ollama.chat(
             model=self.model_name,
             messages=[
@@ -81,7 +210,7 @@ class LuciosAgent:
                 {"role": "user", "content": mensagem_atual},
             ],
             format=ESQUEMA_INTENCAO_MEMORIA,
-            options={"temperature": 0},
+            options=self.opcoes_classificador,
         )
         conteudo = _campo(_campo(resposta, "message", {}), "content", "")
         try:
@@ -89,9 +218,12 @@ class LuciosAgent:
         except (TypeError, ValueError):
             return {"acao": "nenhuma", "consulta": ""}
 
+        if not isinstance(resultado, dict):
+            return {"acao": "nenhuma", "consulta": ""}
+
         acao = resultado.get("acao")
         consulta = resultado.get("consulta", "")
-        if acao not in {"nenhuma", "buscar", "listar_recentes"}:
+        if not isinstance(acao, str) or acao not in {"nenhuma", "buscar", "listar_recentes"}:
             return {"acao": "nenhuma", "consulta": ""}
         if not isinstance(consulta, str):
             return {"acao": "nenhuma", "consulta": ""}
@@ -178,7 +310,11 @@ class LuciosAgent:
                 {"role": "user", "content": user_input},
             ]
 
-            response = ollama.chat(model=self.model_name, messages=mensagens)
+            response = ollama.chat(
+                model=self.model_name,
+                messages=mensagens,
+                options=self.opcoes_modelo,
+            )
             mensagem = _campo(response, "message", {})
             resposta = _campo(mensagem, "content", "") or ""
 
