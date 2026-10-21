@@ -19,7 +19,7 @@ from unittest.mock import patch
 import ollama
 
 from Agent import LuciosAgent
-from orchestrator import Configuracao, _metricas_ollama, medir_etapa
+from orchestrator import Configuracao, ExecucaoCancelada, _metricas_ollama, medir_etapa
 
 
 CENARIOS = {
@@ -115,7 +115,7 @@ def resumir(amostras):
     return resumos
 
 
-def executar_amostra(config, cenario, simulado=False, fabrica_cliente=None):
+def executar_amostra(config, cenario, simulado=False, fabrica_cliente=None, cancelar=None):
     """Isola memória e conversa; preparação do cenário não entra no tempo do pedido."""
     modelos = [config.modelo_economico]
     if config.modelo_complexo:
@@ -137,11 +137,15 @@ def executar_amostra(config, cenario, simulado=False, fabrica_cliente=None):
             chamadas_resumo = 0
             def gerar_resumo(**kwargs):
                 nonlocal chamadas_resumo
+                if cancelar is not None and cancelar.is_set():
+                    raise ExecucaoCancelada("Cancelado antes do resumo.")
                 chamadas_resumo += 1
                 # O resumo mantém seu código atual; a sonda só envolve o transporte.
                 with medir_etapa(agent.medicoes_encerramento[-1].subetapas, "inferencia_resumo") as medicao:
                     resposta = cliente.chat(**kwargs)
                     medicao.metricas = _metricas_ollama(resposta)
+                    if cancelar is not None and cancelar.is_set():
+                        raise ExecucaoCancelada("Cancelado após a inferência de resumo.")
                     return resposta
 
             if cenario == "encerramento":
@@ -154,11 +158,13 @@ def executar_amostra(config, cenario, simulado=False, fabrica_cliente=None):
                     agent.end_conversation()
                     total = time.perf_counter() - inicio
                 estado, medicoes = agent.estado_encerramento, agent.medicoes_encerramento
+                if cancelar is not None and cancelar.is_set():
+                    estado = "cancelado"
                 selecionado, estrategia, chamadas = config.modelo_economico, "encerrar", chamadas_resumo
                 duracao_orquestrador = None
             else:
                 inicio = time.perf_counter()
-                agent.chat(CENARIOS[cenario])
+                agent.chat(CENARIOS[cenario], cancelar=cancelar)
                 total = time.perf_counter() - inicio
                 resultado = agent.ultimo_resultado
                 estado, medicoes = resultado.estado.value, resultado.medicoes
@@ -182,7 +188,8 @@ def executar_amostra(config, cenario, simulado=False, fabrica_cliente=None):
 
 
 def executar_benchmark(configuracoes, cenarios, repeticoes=3, aquecimentos=1,
-                       simulado=False, fabrica_cliente=None, progresso=None):
+                       simulado=False, fabrica_cliente=None, progresso=None,
+                       cancelar=None, ao_concluir=None):
     if repeticoes <= 0 or aquecimentos < 0:
         raise ValueError("Repetições devem ser positivas e aquecimentos não negativos.")
     if not configuracoes or not cenarios or any(c not in CENARIOS for c in cenarios):
@@ -191,14 +198,18 @@ def executar_benchmark(configuracoes, cenarios, repeticoes=3, aquecimentos=1,
     for config in configuracoes:
         for cenario in cenarios:
             for indice in range(aquecimentos + repeticoes):
+                if cancelar is not None and cancelar.is_set():
+                    break
                 if progresso is not None:
                     fase = "aquecimento" if indice < aquecimentos else "medicao"
                     numero = indice + 1 if indice < aquecimentos else indice - aquecimentos + 1
                     progresso(config.modelo_economico, cenario, fase, numero)
-                amostra = executar_amostra(config, cenario, simulado, fabrica_cliente)
+                amostra = executar_amostra(config, cenario, simulado, fabrica_cliente, cancelar)
                 amostra["repeticao"] = indice + 1 if indice < aquecimentos else indice - aquecimentos + 1
                 destino = aquecimento if indice < aquecimentos else amostras
                 destino.append(amostra)
+                if ao_concluir is not None:
+                    ao_concluir(amostra, "aquecimento" if indice < aquecimentos else "medicao")
     return {
         "schema_version": 1, "gerado_em_utc": datetime.now(timezone.utc).isoformat(),
         "modo": "simulado" if simulado else "ollama_real",
@@ -206,6 +217,7 @@ def executar_benchmark(configuracoes, cenarios, repeticoes=3, aquecimentos=1,
                      "arquitetura": platform.machine()},
         "configuracoes": [asdict(config) for config in configuracoes],
         "repeticoes": repeticoes, "aquecimentos_por_cenario": aquecimentos,
+        "interrompido": cancelar is not None and cancelar.is_set(),
         "aquecimentos": aquecimento, "amostras": amostras, "resumos": resumir(amostras),
     }
 

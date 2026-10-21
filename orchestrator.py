@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass, field, replace
 from contextlib import contextmanager
+from contextvars import ContextVar
 from enum import Enum
 import math
 import os
@@ -9,6 +10,29 @@ from threading import Event
 import time
 from typing import Callable
 import unicodedata
+
+
+_observador = ContextVar("observador_medicoes", default=None)
+_caminho_medicoes = ContextVar("caminho_medicoes", default=())
+
+
+@contextmanager
+def observar_medicoes(callback):
+    token = _observador.set(callback)
+    try:
+        yield
+    finally:
+        _observador.reset(token)
+
+
+def _notificar(evento):
+    callback = _observador.get()
+    if callback is not None:
+        try:
+            callback(evento)
+        except Exception:
+            # Uma falha de visualização não muda o resultado da tarefa.
+            pass
 
 
 class Estado(str, Enum):
@@ -85,11 +109,18 @@ def medir_etapa(medicoes, nome, relogio=time.perf_counter):
     medicao = Medicao(nome)
     medicoes.append(medicao)
     inicio = relogio()
+    caminho = _caminho_medicoes.get() + (nome,)
+    token = _caminho_medicoes.set(caminho)
+    _notificar({"fase": "inicio", "etapa": "/".join(caminho)})
     try:
         yield medicao
         medicao.sucesso = True
     finally:
         medicao.duracao = max(0, relogio() - inicio)
+        _notificar({"fase": "fim", "etapa": "/".join(caminho),
+                    "duracao": medicao.duracao, "sucesso": medicao.sucesso,
+                    "metricas": dict(medicao.metricas)})
+        _caminho_medicoes.reset(token)
 
 
 def _metricas_ollama(resposta):
@@ -166,6 +197,8 @@ class ContextoExecucao:
             raise RuntimeError("Limite de chamadas ao modelo atingido.")
         self.resultado.chamadas_modelo += 1
         with self.medir(etapa) as medicao:
+            _notificar({"fase": "modelo", "etapa": "/".join(_caminho_medicoes.get()),
+                        "modelo": parametros.get("model")})
             resposta = self._chamar_modelo(**parametros)
             medicao.metricas = _metricas_ollama(resposta)
             self.verificar_limites()
