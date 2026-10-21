@@ -1,9 +1,9 @@
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from json import JSONDecodeError
 import json
 import threading
 
 from Agent import LuciosAgent
+from orchestrator import Estado
 
 
 HOST = "127.0.0.1"
@@ -663,22 +663,36 @@ class LuciosWebHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path == "/api/chat":
-            payload = self.read_json()
-            message = str(payload.get("message", "")).strip()
+            try:
+                payload = self.read_json()
+            except (ValueError, UnicodeDecodeError):
+                self.send_json({"error": "Envie um objeto JSON válido de até 64 KiB."}, status=400)
+                return
 
-            if not message:
-                self.send_json({"error": "Mensagem vazia."}, status=400)
+            message = payload.get("message", "")
+            if not isinstance(message, str) or not message.strip() or len(message) > agent.configuracao.limite_entrada:
+                self.send_json({"error": "Mensagem inválida ou acima do limite de tamanho."}, status=400)
                 return
 
             with agent_lock:
                 reply = agent.chat(message)
+                estado = agent.ultimo_resultado.estado
+
+            if estado != Estado.CONCLUIDO:
+                self.send_json({"error": reply}, status=409 if estado == Estado.CANCELADO else 502)
+                return
 
             self.send_json({"reply": reply})
             return
 
         if self.path == "/api/clear":
             with agent_lock:
-                reply = agent.clear_memory()
+                reply = agent.chat("limpar")
+                estado = agent.ultimo_resultado.estado
+
+            if estado != Estado.CONCLUIDO:
+                self.send_json({"error": reply}, status=409 if estado == Estado.CANCELADO else 502)
+                return
 
             self.send_json({"reply": reply})
             return
@@ -697,11 +711,13 @@ class LuciosWebHandler(BaseHTTPRequestHandler):
 
     def read_json(self):
         content_length = int(self.headers.get("Content-Length", "0"))
+        if not 0 < content_length <= 65536:
+            raise ValueError("Tamanho de JSON inválido.")
         raw_body = self.rfile.read(content_length).decode("utf-8") if content_length else "{}"
-        try:
-            return json.loads(raw_body)
-        except JSONDecodeError:
-            return {}
+        payload = json.loads(raw_body)
+        if not isinstance(payload, dict):
+            raise ValueError("O JSON deve ser um objeto.")
+        return payload
 
     def send_html(self, html, status=200):
         encoded = html.encode("utf-8")

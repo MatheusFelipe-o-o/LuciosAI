@@ -1,0 +1,203 @@
+"""Fluxo finito de tarefas. Não executa código, comandos ou ferramentas externas."""
+
+from dataclasses import dataclass, field, replace
+from enum import Enum
+import math
+import os
+from threading import Event
+import time
+from typing import Callable
+import unicodedata
+
+
+class Estado(str, Enum):
+    RECEBIDO = "recebido"
+    VALIDANDO = "validando"
+    EXECUTANDO = "executando"
+    VERIFICANDO = "verificando"
+    CONCLUIDO = "concluido"
+    FALHOU = "falhou"
+    CANCELADO = "cancelado"
+
+
+@dataclass(frozen=True)
+class Configuracao:
+    modelo_economico: str = "llama3.2"
+    modelo_complexo: str | None = None
+    contexto: int = 4096
+    limite_resposta: int = 1024
+    timeout: float = 120
+    limite_chamadas: int = 2
+    limite_entrada: int = 16000
+
+    def __post_init__(self):
+        for nome in (self.modelo_economico, self.modelo_complexo):
+            if nome is not None and (not isinstance(nome, str) or not nome.strip()):
+                raise ValueError("O nome do modelo deve ser uma string não vazia.")
+        if self.modelo_economico is None:
+            raise ValueError("Um modelo econômico é obrigatório.")
+        for campo in ("contexto", "limite_resposta", "limite_chamadas", "limite_entrada"):
+            valor = getattr(self, campo)
+            if type(valor) is not int or valor <= 0:
+                raise ValueError(f"{campo} deve ser um inteiro positivo.")
+        if not isinstance(self.timeout, (int, float)) or isinstance(self.timeout, bool):
+            raise ValueError("timeout deve ser um número positivo e finito.")
+        if not math.isfinite(self.timeout) or self.timeout <= 0:
+            raise ValueError("timeout deve ser um número positivo e finito.")
+
+    @classmethod
+    def do_ambiente(cls, modelo: str | None = None):
+        return cls(
+            modelo_economico=modelo if modelo is not None else os.getenv("LUCIOS_MODELO", "llama3.2"),
+            modelo_complexo=os.getenv("LUCIOS_MODELO_COMPLEXO") or None,
+            contexto=int(os.getenv("LUCIOS_CONTEXTO", "4096")),
+            limite_resposta=int(os.getenv("LUCIOS_LIMITE_RESPOSTA", "1024")),
+            timeout=float(os.getenv("LUCIOS_TIMEOUT", "120")),
+        )
+
+
+@dataclass(frozen=True)
+class Decisao:
+    estrategia: str
+    complexidade: str
+    modelo: str | None
+    motivo: str
+    risco: str = "sem_execucao_externa"
+
+
+@dataclass
+class Resultado:
+    estados: list[Estado] = field(default_factory=lambda: [Estado.RECEBIDO])
+    decisao: Decisao | None = None
+    resposta: str = ""
+    erro: str | None = None
+    chamadas_modelo: int = 0
+    duracao: float = 0
+
+    @property
+    def estado(self):
+        return self.estados[-1]
+
+    def transicionar(self, destino: Estado):
+        permitidas = {
+            Estado.RECEBIDO: {Estado.VALIDANDO},
+            Estado.VALIDANDO: {Estado.EXECUTANDO, Estado.FALHOU, Estado.CANCELADO},
+            Estado.EXECUTANDO: {Estado.VERIFICANDO, Estado.FALHOU, Estado.CANCELADO},
+            Estado.VERIFICANDO: {Estado.CONCLUIDO, Estado.FALHOU, Estado.CANCELADO},
+        }
+        if destino not in permitidas.get(self.estado, set()):
+            raise ValueError(f"Transição inválida: {self.estado.value} -> {destino.value}")
+        self.estados.append(destino)
+
+
+class ExecucaoCancelada(Exception):
+    pass
+
+
+class ContextoExecucao:
+    def __init__(self, config, resultado, chamar_modelo, cancelar, relogio):
+        self.config = config
+        self.resultado = resultado
+        self._chamar_modelo = chamar_modelo
+        self._cancelar = cancelar
+        self._relogio = relogio
+        self.inicio = relogio()
+
+    def verificar_limites(self):
+        if self._cancelar is not None and self._cancelar.is_set():
+            raise ExecucaoCancelada("Tarefa cancelada.")
+        if self._relogio() - self.inicio >= self.config.timeout:
+            raise TimeoutError("A tarefa excedeu o orçamento de tempo.")
+
+    def chamar_modelo(self, **parametros):
+        self.verificar_limites()
+        if self.resultado.chamadas_modelo >= self.config.limite_chamadas:
+            raise RuntimeError("Limite de chamadas ao modelo atingido.")
+        self.resultado.chamadas_modelo += 1
+        resposta = self._chamar_modelo(**parametros)
+        self.verificar_limites()
+        return resposta
+
+
+def _normalizar(texto):
+    return "".join(
+        letra for letra in unicodedata.normalize("NFKD", texto.casefold())
+        if not unicodedata.combining(letra)
+    )
+
+
+def _nome_modelo(nome):
+    return nome if ":" in nome else nome + ":latest"
+
+
+class Orquestrador:
+    def __init__(self, config: Configuracao, chamar_modelo: Callable,
+                 listar_modelos: Callable, relogio: Callable = time.monotonic):
+        self.config = config
+        self._chamar_modelo = chamar_modelo
+        self._listar_modelos = listar_modelos
+        self._relogio = relogio
+
+    def classificar(self, texto: str) -> Decisao:
+        normalizado = _normalizar(texto)
+        if normalizado == "limpar":
+            return Decisao("limpar", "simples", None, "Comando local existente.")
+        sinais = ("planeje", "plano detalhado", "analise detalhada", "analise profunda",
+                  "compare alternativas", "passo a passo", "arquitetura", "investigue")
+        complexa = len(texto) > 2000 or any(sinal in normalizado for sinal in sinais)
+        return Decisao(
+            "conversar", "complexa" if complexa else "intermediaria",
+            self.config.modelo_economico,
+            "Heurística de planejamento/análise." if complexa else "Conversa com modelo econômico.",
+        )
+
+    def _selecionar_modelo(self, decisao, contexto):
+        if decisao.complexidade != "complexa" or not self.config.modelo_complexo:
+            if decisao.complexidade == "complexa":
+                return replace(decisao, motivo="Fallback: modelo complexo não configurado.")
+            return decisao
+        contexto.verificar_limites()
+        try:
+            disponiveis = {_nome_modelo(nome) for nome in self._listar_modelos()}
+        except Exception:
+            contexto.verificar_limites()
+            return replace(decisao, motivo="Fallback: catálogo local indisponível.")
+        contexto.verificar_limites()
+        if _nome_modelo(self.config.modelo_complexo) in disponiveis:
+            return replace(decisao, modelo=self.config.modelo_complexo,
+                           motivo="Modelo complexo configurado e instalado.")
+        return replace(decisao, motivo="Fallback: modelo complexo não instalado.")
+
+    def executar(self, pedido, responder: Callable, limpar: Callable,
+                 cancelar: Event | None = None) -> Resultado:
+        resultado = Resultado()
+        contexto = ContextoExecucao(self.config, resultado, self._chamar_modelo,
+                                   cancelar, self._relogio)
+        resultado.transicionar(Estado.VALIDANDO)
+        try:
+            contexto.verificar_limites()
+            if not isinstance(pedido, str) or not pedido.strip():
+                raise ValueError("A mensagem deve ser um texto não vazio.")
+            if len(pedido) > self.config.limite_entrada:
+                raise ValueError(f"Mensagem excede {self.config.limite_entrada} caracteres.")
+            texto = pedido.strip()
+            resultado.decisao = self._selecionar_modelo(self.classificar(texto), contexto)
+            contexto.verificar_limites()
+            resultado.transicionar(Estado.EXECUTANDO)
+            resposta = limpar() if resultado.decisao.estrategia == "limpar" else responder(
+                texto, resultado.decisao.modelo, contexto
+            )
+            resultado.transicionar(Estado.VERIFICANDO)
+            contexto.verificar_limites()
+            if not isinstance(resposta, str) or not resposta.strip():
+                raise ValueError("O modelo ou a operação não retornou uma resposta textual válida.")
+            resultado.resposta = resposta
+            resultado.transicionar(Estado.CONCLUIDO)
+        except ExecucaoCancelada as erro:
+            resultado.erro = str(erro)
+            resultado.transicionar(Estado.CANCELADO)
+        except Exception as erro:
+            resultado.erro = str(erro)
+            resultado.transicionar(Estado.FALHOU)
+        resultado.duracao = max(0, self._relogio() - contexto.inicio)
+        return resultado

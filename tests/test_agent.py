@@ -1,13 +1,19 @@
 import unittest
+from threading import Event
 from unittest.mock import Mock, patch
+
+import ollama
 
 from Agent import LuciosAgent
 from main import _formatar_para_terminal
+from orchestrator import Configuracao, Estado
 
 
 class ConciliacaoTests(unittest.TestCase):
     def setUp(self):
-        self.agent = LuciosAgent()
+        self.cliente = Mock()
+        self.cliente.chat.side_effect = lambda **kwargs: ollama.chat(**kwargs)
+        self.agent = LuciosAgent(cliente=self.cliente, configuracao=Configuracao())
         self.agent.memory_manager = Mock()
 
     @patch("Agent.ollama.chat")
@@ -103,6 +109,56 @@ class ConciliacaoTests(unittest.TestCase):
             self.assertEqual(_formatar_para_terminal("**Olá**"), "**Olá**")
         with patch("main.sys.stdout.isatty", return_value=True):
             self.assertEqual(_formatar_para_terminal("**Olá**"), "\033[1mOlá\033[0m")
+
+    def test_modelo_complexo_selecionado_sem_mudar_modelo_da_memoria(self):
+        cliente = Mock()
+        cliente.list.return_value = {"models": [{"model": "grande:8b"}]}
+        cliente.chat.return_value = {"message": {"content": "Plano de exemplo"}}
+        agent = LuciosAgent(configuracao=Configuracao(modelo_complexo="grande:8b"), cliente=cliente)
+        self.assertEqual(agent.chat("Planeje uma arquitetura"), "Plano de exemplo")
+        self.assertEqual(cliente.chat.call_args.kwargs["model"], "grande:8b")
+        self.assertEqual(agent.model_name, "llama3.2")
+        self.assertEqual(agent.memory_manager.model_name, "llama3.2")
+
+    @patch("Agent.ollama.chat")
+    def test_fallback_memoria_e_resposta_compartilham_orcamento(self, chat):
+        chat.side_effect = [
+            {"message": {"content": '{"acao":"nenhuma","consulta":""}'}},
+            {"message": {"content": "Explicação"}},
+        ]
+        self.assertEqual(self.agent.chat("Como funciona sua memória?"), "Explicação")
+        self.assertEqual(self.agent.ultimo_resultado.chamadas_modelo, 2)
+        self.assertEqual(self.agent.ultimo_resultado.estado, Estado.CONCLUIDO)
+
+    @patch("Agent.ollama.chat")
+    def test_resposta_vazia_nao_entra_na_conversa(self, chat):
+        chat.return_value = {"message": {"content": ""}}
+        self.assertIn("erro", self.agent.chat("Olá"))
+        self.assertEqual(self.agent.conversa, [])
+        self.assertEqual(self.agent.ultimo_resultado.estado, Estado.FALHOU)
+
+    @patch("Agent.ollama.chat")
+    def test_comando_limpar_passa_pelo_nucleo_sem_inferencia(self, chat):
+        self.agent.conversa = [{"role": "user", "content": "exemplo"}]
+        self.agent.chat("limpar")
+        self.assertEqual(self.agent.ultimo_resultado.estado, Estado.CONCLUIDO)
+        self.assertEqual(self.agent.conversa, [])
+        chat.assert_not_called()
+
+    def test_cliente_local_recebe_timeout_configurado(self):
+        with patch("Agent.ollama.Client") as client:
+            LuciosAgent(configuracao=Configuracao(timeout=20))
+            client.assert_called_once_with(host="http://127.0.0.1:11434", timeout=20)
+
+    def test_cancelamento_descarta_resposta_sem_alterar_conversa(self):
+        cancelar = Event()
+        def responder(**kwargs):
+            cancelar.set()
+            return {"message": {"content": "resposta tardia"}}
+        self.cliente.chat.side_effect = responder
+        self.assertIn("cancelada", self.agent.chat("Olá", cancelar))
+        self.assertEqual(self.agent.conversa, [])
+        self.assertEqual(self.agent.ultimo_resultado.estado, Estado.CANCELADO)
 
 
 if __name__ == "__main__":

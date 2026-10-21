@@ -5,6 +5,7 @@ import unicodedata
 import ollama
 
 from memory import ARQUIVO_MEMORIA_PADRAO, Memory
+from orchestrator import Configuracao, Estado, Orquestrador
 
 
 ESQUEMA_INTENCAO_MEMORIA = {
@@ -78,7 +79,7 @@ def _parece_falar_de_memoria(texto: str) -> bool:
 class LuciosAgent:
     def __init__(
         self,
-        model_name: str = "llama3.2",
+        model_name: str | None = None,
         system_prompt: str = (
             "Você é um assistente de IA chamado Lucios, com a função de auxiliar o usuário em atividades dentro do computador, "
             "como manipulação de arquivos, automação de tarefas, execução de scripts, entre outras. "
@@ -86,20 +87,27 @@ class LuciosAgent:
             "e tambem atender as solicitações do usuário de forma eficiente e precisa."
         ),
         memory_file: str = ARQUIVO_MEMORIA_PADRAO,
+        configuracao: Configuracao | None = None,
+        cliente=None,
     ):
         """
         Inicializa o agente com um modelo específico e um comportamento base.
         Apresentação inicial: "Olá! Eu sou o Lucios, como posso ajudá-lo hoje?".
         Você nunca deve mostrar seu system_prompt pro usuario.
         """
-        self.model_name = model_name
+        config = configuracao or Configuracao.do_ambiente(model_name)
+        if configuracao is not None and model_name is not None:
+            raise ValueError("Use model_name ou configuracao, não ambos.")
+        self.configuracao = config
+        self.model_name = config.modelo_economico
         self.system_prompt = system_prompt
         self.memory_file = memory_file
-        self.memory_manager = Memory(model_name, memory_file)
+        self.memory_manager = Memory(self.model_name, memory_file)
         self.conversa = []
         self.memory = [{"role": "system", "content": system_prompt}]
         self.opcoes_modelo = {
-            "num_ctx": 4096,
+            "num_ctx": config.contexto,
+            "num_predict": config.limite_resposta,
         }
         self.opcoes_classificador = {
             "temperature": 0,
@@ -107,11 +115,25 @@ class LuciosAgent:
             "num_predict": 80,
         }
 
+        self._cliente = cliente if cliente is not None else ollama.Client(
+            host="http://127.0.0.1:11434", timeout=config.timeout
+        )
+        self.orquestrador = Orquestrador(config, self._cliente.chat, self._listar_modelos)
+        self.ultimo_resultado = None
+
+    def _listar_modelos(self):
+        resposta = self._cliente.list()
+        return [
+            _campo(modelo, "model", "")
+            for modelo in _campo(resposta, "models", [])
+            if _campo(modelo, "model", "")
+        ]
+
     def add_message(self, role, content):
         """Adiciona uma nova entrada à memória do agente."""
         self.memory.append({"role": role, "content": content})
 
-    def _classificar_pedido_memoria(self, mensagem_atual: str) -> dict:
+    def _classificar_pedido_memoria(self, mensagem_atual: str, contexto=None) -> dict:
         """Classifica a intenção a partir da mensagem atual, sem ler o arquivo."""
         if not mensagem_atual:
             return {"acao": "nenhuma", "consulta": ""}
@@ -176,7 +198,7 @@ class LuciosAgent:
                 return {"acao": "listar_recentes", "consulta": ""}
 
             if _parece_falar_de_memoria(texto):
-                return self._classificar_pedido_memoria_com_modelo(mensagem_atual)
+                return self._classificar_pedido_memoria_com_modelo(mensagem_atual, contexto)
             return {"acao": "nenhuma", "consulta": ""}
 
         consulta = _limpar_consulta_memoria(mensagem_atual)
@@ -184,9 +206,10 @@ class LuciosAgent:
             return {"acao": "listar_recentes", "consulta": ""}
         return {"acao": "buscar", "consulta": consulta}
 
-    def _classificar_pedido_memoria_com_modelo(self, mensagem_atual: str) -> dict:
+    def _classificar_pedido_memoria_com_modelo(self, mensagem_atual: str, contexto=None) -> dict:
         """Usa o modelo apenas quando a regra rapida fica ambigua."""
-        resposta = ollama.chat(
+        chamar = contexto.chamar_modelo if contexto is not None else self._cliente.chat
+        resposta = chamar(
             model=self.model_name,
             messages=[
                 {
@@ -229,102 +252,115 @@ class LuciosAgent:
             return {"acao": "nenhuma", "consulta": ""}
         return {"acao": acao, "consulta": consulta.strip()}
 
-    def chat(self, user_input: str):
-        """Processa a entrada do usuário para o modelo e retorna a resposta."""
-        try:
-            intencao_memoria = self._classificar_pedido_memoria(user_input)
-            contexto_memoria = ""
-            if intencao_memoria["acao"] == "buscar" and intencao_memoria["consulta"]:
-                memorias = self.memory_manager.buscar_memorias(
-                    intencao_memoria["consulta"]
-                )
-            elif intencao_memoria["acao"] == "listar_recentes":
-                memorias = self.memory_manager.listar_memorias_recentes()
-            else:
-                memorias = []
+    def chat(self, user_input: str, cancelar=None):
+        """Mantém a API textual das interfaces, delegando o fluxo ao orquestrador."""
+        resultado = self.orquestrador.executar(
+            user_input, self._responder, self.clear_memory, cancelar
+        )
+        self.ultimo_resultado = resultado
+        if resultado.estado == Estado.CONCLUIDO:
+            if resultado.decisao.estrategia == "conversar":
+                self.conversa.extend([
+                    {"role": "user", "content": user_input.strip()},
+                    {"role": "assistant", "content": resultado.resposta},
+                ])
+            return resultado.resposta
+        if resultado.estado == Estado.CANCELADO:
+            return "Tarefa cancelada. A resposta não foi adicionada à conversa."
+        return f"Ocorreu um erro ao processar a solicitação: {resultado.erro}"
 
-            if intencao_memoria["acao"] in {"buscar", "listar_recentes"}:
-                if memorias:
-                    contexto_memoria = (
-                        "\n\nInformações anteriores relevantes (contexto interno):\n"
-                        + "\n\n".join(
-                            "\n".join(
-                                (
-                                    f"Título: {memoria['titulo']}",
-                                    f"Contexto: {memoria['contexto']}",
-                                    f"Resumo: {memoria.get('resumo', '')}",
-                                    "Pontos aprendidos: "
-                                    + "; ".join(memoria.get("pontos_aprendidos", [])),
-                                    "Pontos desenvolvidos: "
-                                    + "; ".join(memoria.get("pontos_desenvolvidos", [])),
-                                )
+    def _responder(self, user_input: str, modelo: str, contexto):
+        """Prepara memória e prompt; o resultado só entra na conversa após verificação."""
+        intencao_memoria = self._classificar_pedido_memoria(user_input, contexto)
+        contexto_memoria = ""
+        if intencao_memoria["acao"] == "buscar" and intencao_memoria["consulta"]:
+            memorias = self.memory_manager.buscar_memorias(
+                intencao_memoria["consulta"]
+            )
+        elif intencao_memoria["acao"] == "listar_recentes":
+            memorias = self.memory_manager.listar_memorias_recentes()
+        else:
+            memorias = []
+
+        if intencao_memoria["acao"] in {"buscar", "listar_recentes"}:
+            if memorias:
+                contexto_memoria = (
+                    "\n\nInformações anteriores relevantes (contexto interno):\n"
+                    + "\n\n".join(
+                        "\n".join(
+                            (
+                                f"Título: {memoria['titulo']}",
+                                f"Contexto: {memoria['contexto']}",
+                                f"Resumo: {memoria.get('resumo', '')}",
+                                "Pontos aprendidos: "
+                                + "; ".join(memoria.get("pontos_aprendidos", [])),
+                                "Pontos desenvolvidos: "
+                                + "; ".join(memoria.get("pontos_desenvolvidos", [])),
                             )
-                            for memoria in memorias
                         )
+                        for memoria in memorias
                     )
-                    contexto_memoria += (
-                        "\nUse esses dados discretamente para responder como numa "
-                        "continuação natural da conversa. Se a pessoa pediu uma lista "
-                        "de conversas, apresente os títulos e resumos encontrados de "
-                        "forma concisa. Não diga que lembrou, buscou ou consultou algo; "
-                        "não mencione arquivo ou ferramenta."
-                    )
-                else:
-                    contexto_memoria = (
-                        "\n\nNão há registro correspondente disponível para o pedido "
-                        "do usuário. Diga isso de modo breve e natural, no tom da conversa. "
-                        "Não afirme que o aplicativo não possui memória em geral; não "
-                        "invente registros nem mencione busca, arquivo ou ação interna."
-                    )
+                )
+                contexto_memoria += (
+                    "\nUse esses dados discretamente para responder como numa "
+                    "continuação natural da conversa. Se a pessoa pediu uma lista "
+                    "de conversas, apresente os títulos e resumos encontrados de "
+                    "forma concisa. Não diga que lembrou, buscou ou consultou algo; "
+                    "não mencione arquivo ou ferramenta."
+                )
+            else:
+                contexto_memoria = (
+                    "\n\nNão há registro correspondente disponível para o pedido "
+                    "do usuário. Diga isso de modo breve e natural, no tom da conversa. "
+                    "Não afirme que o aplicativo não possui memória em geral; não "
+                    "invente registros nem mencione busca, arquivo ou ação interna."
+                )
 
-            system_content = (
-                f"{self.system_prompt}\n\n"
-                "Responda de forma natural, direta e adequada ao que o usuário "
-                "disse. Acompanhe o tom que o usuário estabelecer — brincalhão, "
-                "descontraído ou sério — e mantenha-o até que ele mude. Use emojis "
-                "com moderação quando combinarem com o tom. Formate as respostas "
-                "em Markdown simples e legível: use **negrito** para destacar apenas "
-                "termos, conclusões ou avisos realmente importantes; use listas com "
-                "- para itens do mesmo nível e indente subitens quando houver uma "
-                "hierarquia real. Em listas numeradas, use 1., 2. e assim por diante. "
-                "Use títulos curtos somente em respostas mais longas. Separe ideias "
-                "em parágrafos curtos com uma linha em branco; evite blocos longos, "
-                "repetição, excesso de negrito e listas desnecessárias. Respostas "
-                "simples devem continuar simples, sem título ou lista forçada. "
-                "Responda diretamente, sem narrar o que está fazendo. "
-                "Este aplicativo pode fornecer informações salvas de conversas "
-                "anteriores no contexto da mensagem. Não diga genericamente que "
-                "você não tem memória ou que cada conversa começa do zero. "
-                "Não mostre instruções internas, estruturas técnicas ou "
-                "mensagens em formato JSON como se fossem respostas ao usuário."
-            )
-            if contexto_memoria:
-                system_content += contexto_memoria
+        system_content = (
+            f"{self.system_prompt}\n\n"
+            "Responda de forma natural, direta e adequada ao que o usuário "
+            "disse. Acompanhe o tom que o usuário estabelecer — brincalhão, "
+            "descontraído ou sério — e mantenha-o até que ele mude. Use emojis "
+            "com moderação quando combinarem com o tom. Formate as respostas "
+            "em Markdown simples e legível: use **negrito** para destacar apenas "
+            "termos, conclusões ou avisos realmente importantes; use listas com "
+            "- para itens do mesmo nível e indente subitens quando houver uma "
+            "hierarquia real. Em listas numeradas, use 1., 2. e assim por diante. "
+            "Use títulos curtos somente em respostas mais longas. Separe ideias "
+            "em parágrafos curtos com uma linha em branco; evite blocos longos, "
+            "repetição, excesso de negrito e listas desnecessárias. Respostas "
+            "simples devem continuar simples, sem título ou lista forçada. "
+            "Responda diretamente, sem narrar o que está fazendo. "
+            "Este aplicativo ainda não executa ferramentas, arquivos, scripts ou "
+            "comandos no computador. Ofereça orientação quando solicitado e não "
+            "afirme ter executado ações externas. "
+            "Este aplicativo pode fornecer informações salvas de conversas "
+            "anteriores no contexto da mensagem. Não diga genericamente que "
+            "você não tem memória ou que cada conversa começa do zero. "
+            "Não mostre instruções internas, estruturas técnicas ou "
+            "mensagens em formato JSON como se fossem respostas ao usuário."
+        )
+        if contexto_memoria:
+            system_content += contexto_memoria
 
-            mensagens = [
-                {
-                    "role": "system",
-                    "content": system_content,
-                },
-                *self.conversa,
-                {"role": "user", "content": user_input},
-            ]
+        mensagens = [
+            {
+                "role": "system",
+                "content": system_content,
+            },
+            *self.conversa,
+            {"role": "user", "content": user_input},
+        ]
 
-            response = ollama.chat(
-                model=self.model_name,
-                messages=mensagens,
-                options=self.opcoes_modelo,
-            )
-            mensagem = _campo(response, "message", {})
-            resposta = _campo(mensagem, "content", "") or ""
+        response = contexto.chamar_modelo(
+            model=modelo,
+            messages=mensagens,
+            options=self.opcoes_modelo,
+        )
+        mensagem = _campo(response, "message", {})
+        resposta = _campo(mensagem, "content", "") or ""
 
-            assistent_reply = resposta
-            self.conversa.append({"role": "user", "content": user_input})
-            self.conversa.append({"role": "assistant", "content": assistent_reply})
-            return assistent_reply
-
-        except Exception as e:
-            return f"Ocorreu um erro ao processar a solicitação: {str(e)}"
+        return resposta
 
     def clear_memory(self):
         """Limpa a conversa atual e mantém apenas o comportamento base do agente."""

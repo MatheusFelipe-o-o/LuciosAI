@@ -22,8 +22,7 @@ if __name__ == "__main__":
             print("Encerrando a conversa. Até logo!")
             break
         elif user_input.lower() == "limpar":
-            lucios.clear_memory()
-            print("Memória do agente limpa.")
+            print(lucios.chat("limpar"))
             break
 
         response = lucios.chat(user_input)
