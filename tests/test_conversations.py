@@ -6,6 +6,17 @@ from conversations import ConversationStore
 
 
 class ConversationTests(unittest.TestCase):
+    def test_exclusao_persiste_e_preserva_outros(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "history.db"
+            store = ConversationStore(path)
+            a, b = store.create(), store.create()
+            store.delete(a["id"])
+            reopened = ConversationStore(path)
+            with self.assertRaises(ValueError):
+                reopened.get(a["id"])
+            self.assertEqual(reopened.get(b["id"])["id"], b["id"])
+
     def test_reabre_banco_sem_perder_conversa_e_contexto(self):
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "private" / "history.db"

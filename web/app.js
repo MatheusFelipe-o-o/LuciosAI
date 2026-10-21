@@ -72,13 +72,35 @@ function renderRecent() {
     button.textContent = item.title; button.title = item.title;
     button.setAttribute("aria-current", String(item.id === currentId));
     button.disabled = busy;
-    button.addEventListener("click", () => openConversation(item.id)); list.append(button);
+    button.addEventListener("click", () => openConversation(item.id));
+    const row = document.createElement("div"); row.className = "recent-row";
+    const remove = document.createElement("button"); remove.className = "delete-conversation";
+    remove.title = "Excluir conversa"; remove.setAttribute("aria-label", `Excluir conversa: ${item.title}`);
+    remove.disabled = busy;
+    const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    icon.setAttribute("aria-hidden", "true");
+    const use = document.createElementNS("http://www.w3.org/2000/svg", "use");
+    use.setAttribute("href", "#i-trash"); icon.append(use); remove.append(icon);
+    remove.addEventListener("click", () => deleteConversation(item));
+    row.append(button, remove); list.append(row);
   }
   if (!filtered.length) {
     const empty = document.createElement("p"); empty.className = "list-empty";
     empty.textContent = query ? "Nenhuma conversa encontrada." : "Suas conversas aparecem aqui.";
     list.append(empty);
   }
+}
+async function deleteConversation(item) {
+  if (busy || !window.confirm(`Excluir a conversa “${item.title}”?\n\nAs mensagens e o contexto deste chat serão removidos do histórico. Essa ação não pode ser desfeita. Resumos já salvos na memória serão mantidos.`)) return;
+  setBusy(true); renderRecent(); $("status").textContent = "Excluindo conversa…";
+  try {
+    await api("/api/delete", {conversation_id: item.id});
+    recent = recent.filter(c => c.id !== item.id);
+    setBusy(false);
+    if (currentId === item.id) newChat();
+    renderRecent(); toast("Conversa excluída do histórico.");
+  } catch (error) { toast(error.message); }
+  finally { setBusy(false); renderRecent(); }
 }
 async function refreshRecent() {
   const data = await api("/api/conversations"); recent = data.conversations;

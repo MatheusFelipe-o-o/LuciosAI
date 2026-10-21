@@ -79,6 +79,33 @@ class WebTests(unittest.TestCase):
         self.assertNotIn("context", loaded)
         self.assertEqual(loaded["title"], "Mensagem A")
 
+    def test_excluir_remove_apenas_escolhida_e_limpa_contexto_ativo(self):
+        a = self.post("/api/new")[1]["id"]
+        b = self.post("/api/new")[1]["id"]
+        self.post(corpo={"message": "Olá", "conversation_id": a})
+        self.assertEqual(self.post("/api/delete", {"conversation_id": b})[0], 200)
+        self.assertEqual(len(self.agent.conversa), 2)
+        self.assertEqual(self.get("/api/conversation?id=" + a)[0], 200)
+        self.assertEqual(self.get("/api/conversation?id=" + b)[0], 404)
+        self.assertEqual(self.post("/api/delete", {"conversation_id": a})[0], 200)
+        self.assertEqual(self.agent.conversa, [])
+        self.assertEqual(self.get("/api/conversation?id=" + a)[0], 404)
+        self.agent.memory_manager.salvar_memoria.assert_not_called()
+
+    def test_excluir_id_invalido_ou_ausente(self):
+        for identifier in (None, [], 123, "' OR 1=1 --", "0" * 32):
+            self.assertEqual(self.post("/api/delete", {"conversation_id": identifier})[0], 404)
+
+    def test_excluir_exige_token(self):
+        identifier = self.post("/api/new")[1]["id"]
+        conn = HTTPConnection("127.0.0.1", self.servidor.server_port, timeout=3)
+        self.addCleanup(conn.close)
+        conn.request("POST", "/api/delete", json.dumps({"conversation_id": identifier}))
+        response = conn.getresponse()
+        self.assertEqual(response.status, 403)
+        response.read()
+        self.assertEqual(self.get("/api/conversation?id=" + identifier)[0], 200)
+
     def test_falha_nao_entra_no_historico(self):
         identifier = self.post("/api/new")[1]["id"]
         self.cliente.chat.side_effect = RuntimeError("offline")

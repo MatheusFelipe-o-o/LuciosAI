@@ -24,6 +24,7 @@ class LuciosServer(ThreadingHTTPServer):
         self.token = secrets.token_urlsafe(24)
         self.lab = None
         self.lab_lock = threading.Lock()
+        self.active_conversation_id = None
 
     def open_lab(self):
         # Optional package: chat works without benchmark dependencies.
@@ -97,6 +98,15 @@ class LuciosWebHandler(BaseHTTPRequestHandler):
             if self.path == "/api/new":
                 self.send_json(self.server.store.create())
                 return
+            if self.path == "/api/delete":
+                identifier = payload.get("conversation_id")
+                with agent_lock:
+                    self.server.store.delete(identifier)
+                    if self.server.active_conversation_id == identifier:
+                        agent.clear_memory()
+                        self.server.active_conversation_id = None
+                self.send_json({"ok": True})
+                return
             if self.path == "/api/lab":
                 try:
                     self.send_json({"url": self.server.open_lab()})
@@ -119,6 +129,7 @@ class LuciosWebHandler(BaseHTTPRequestHandler):
                     conversation = self.server.store.get(payload["conversation_id"])
                     agent.clear_memory()
                     agent.conversa = conversation["context"]
+                    self.server.active_conversation_id = conversation["id"]
                 if self.path == "/api/end":
                     reply = agent.end_conversation()
                     success = agent.estado_encerramento != "falhou"

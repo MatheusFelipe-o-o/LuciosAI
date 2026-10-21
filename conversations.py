@@ -50,6 +50,14 @@ class ConversationStore:
             return [dict(row) for row in db.execute(
                 "SELECT id, title, updated FROM conversations ORDER BY updated DESC")]
 
+    def delete(self, identifier):
+        if not isinstance(identifier, str) or len(identifier) != 32:
+            raise ValueError("Conversa não encontrada.")
+        with self.connect() as db:
+            deleted = db.execute("DELETE FROM conversations WHERE id = ?", (identifier,))
+            if deleted.rowcount != 1:
+                raise ValueError("Conversa não encontrada.")
+
     def save(self, conversation, context):
         messages = conversation["messages"]
         first = next((m["content"] for m in messages if m["role"] == "user"), "Nova conversa")

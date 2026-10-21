@@ -19,9 +19,9 @@ class Element {
 for(const match of html.matchAll(/id="([^"]+)"/g))elements.set(match[1],new Element());
 const el=id=>elements.get(id);
 const requests=[];
-let entries=[],failChat=false,mobile=false,opened=0,lastTarget;
-const document={body:new Element(),getElementById:el,querySelector:()=>({content:'secret-token'}),querySelectorAll:()=>[],createElement:tag=>new Element(tag),createTextNode:text=>{const e=new Element('#text');e.textContent=text;return e;},addEventListener:()=>{}};
-const context={console,document,setTimeout:()=>0,clearTimeout:()=>{},window:{matchMedia:()=>({matches:mobile,addEventListener:()=>{}}),open:()=>{opened++;lastTarget={location:{replace:url=>{lastTarget.url=url;}},close:()=>{}};return lastTarget;}},
+let entries=[],failChat=false,mobile=false,opened=0,lastTarget,confirmDelete=false,failDelete=false,confirmation='';
+const document={body:new Element(),getElementById:el,querySelector:()=>({content:'secret-token'}),querySelectorAll:()=>[],createElementNS:(_,tag)=>new Element(tag),createElement:tag=>new Element(tag),createTextNode:text=>{const e=new Element('#text');e.textContent=text;return e;},addEventListener:()=>{}};
+const context={console,document,setTimeout:()=>0,clearTimeout:()=>{},window:{confirm:text=>{confirmation=text;return confirmDelete;},matchMedia:()=>({matches:mobile,addEventListener:()=>{}}),open:()=>{opened++;lastTarget={location:{replace:url=>{lastTarget.url=url;}},close:()=>{}};return lastTarget;}},
   fetch:async(path,options)=>{
     requests.push({path,options});
     const body=options?.body?JSON.parse(options.body):{};
@@ -32,6 +32,11 @@ const context={console,document,setTimeout:()=>0,clearTimeout:()=>{},window:{mat
       entries[0].title=body.message;return {ok:true,json:async()=>({reply:'**Resposta**\n\n- Item'})};
     }
     if(path.startsWith('/api/conversation?'))return {ok:true,json:async()=>({...entries[0],messages:[{role:'user',content:'Anterior'},{role:'assistant',content:'Olá'}]})};
+    if(path==='/api/delete'){
+      if(failDelete)return {ok:false,json:async()=>({error:'Falha ao excluir'})};
+      entries=entries.filter(item=>item.id!==body.conversation_id);
+      return {ok:true,json:async()=>({ok:true})};
+    }
     if(path==='/api/lab')return {ok:true,json:async()=>({url:'http://127.0.0.1:12345'})};
     return {ok:true,json:async()=>({reply:'Salvo'})};
   }};
@@ -57,7 +62,7 @@ async function main(){
   assert.match(el('recentList').textContent,/Nenhuma conversa/);
   el('search').value='';el('search').events.input();
   el('newBtn').events.click();assert.equal(el('welcome').hidden,false);assert.equal(el('messages').children.length,0);
-  await el('recentList').children.find(e=>e.className==='recent').events.click();
+  await el('recentList').children.find(e=>e.className==='recent-row').children[0].events.click();
   await settle();assert.equal(el('messages').children.length,2);
   failChat=true;el('prompt').value='Tente novamente';
   await el('chatForm').events.submit({preventDefault(){}});
@@ -70,6 +75,24 @@ async function main(){
   vm.runInContext('renderMarkdown("```html\\n<img src=x onerror=alert(1)>\\n```", container)',context);
   assert.equal(container.children[0].tagName,'pre');assert.equal(container.children[0].children[0].children.length,0);
   assert.match(container.textContent,/<img/);
+  const deleteButton=()=>el('recentList').children.find(e=>e.className==='recent-row').children[1];
+  let before=requests.filter(r=>r.path==='/api/delete').length;
+  await deleteButton().events.click();
+  assert(confirmation.includes(entries[0].title));
+  assert.equal(requests.filter(r=>r.path==='/api/delete').length,before);
+  assert.equal(el('messages').children.length,2);
+  confirmDelete=true;failDelete=true;
+  await deleteButton().events.click();
+  assert.equal(el('messages').children.length,2);assert.equal(entries.length,1);
+  assert.match(el('toast').textContent,/Falha ao excluir/);
+  failDelete=false;
+  entries.unshift({id:'b'.repeat(32),title:'Outro chat',updated:new Date().toISOString()});
+  await vm.runInContext('refreshRecent()',context);
+  await deleteButton().events.click();
+  assert.equal(el('messages').children.length,2);assert.equal(entries.length,1);
+  await deleteButton().events.click();
+  assert.equal(entries.length,0);assert.equal(el('messages').children.length,0);
+  assert.equal(el('welcome').hidden,false);assert.equal(el('recentCount').textContent,'0');
   console.log('Chat UI: flows, recent search, safe Markdown, errors, lab and mobile menu passed.');
 }
 main().catch(error=>{console.error(error);process.exitCode=1;});
