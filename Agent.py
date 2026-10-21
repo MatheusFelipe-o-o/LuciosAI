@@ -258,11 +258,12 @@ class LuciosAgent:
             return {"acao": "nenhuma", "consulta": ""}
         return {"acao": acao, "consulta": consulta.strip()}
 
-    def chat(self, user_input: str, cancelar=None):
+    def chat(self, user_input: str, cancelar=None, *, modelo_resposta=None):
         """Mantém a API textual das interfaces, delegando o fluxo ao orquestrador."""
         inicio_chat = time.perf_counter()
         resultado = self.orquestrador.executar(
-            user_input, self._responder, self.clear_memory, cancelar
+            user_input, self._responder, self.clear_memory, cancelar,
+            modelo_resposta=modelo_resposta
         )
         try:
             with medir_etapa(resultado.medicoes, "finalizacao_chat"):

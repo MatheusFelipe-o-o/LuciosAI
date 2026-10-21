@@ -1,11 +1,28 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import sqlite3
 import unittest
 
 from conversations import ConversationStore
 
 
 class ConversationTests(unittest.TestCase):
+    def test_banco_antigo_ganha_modelo_automatico_sem_perder_mensagens(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "history.db"
+            db = sqlite3.connect(path)
+            try:
+                with db:
+                    db.execute("""CREATE TABLE conversations (id TEXT PRIMARY KEY, title TEXT NOT NULL,
+                               messages TEXT NOT NULL, context TEXT NOT NULL, updated TEXT NOT NULL)""")
+                    db.execute("INSERT INTO conversations VALUES (?, ?, ?, ?, ?)",
+                               ("a" * 32, "Antiga", '[{"role":"user","content":"Oi"}]', "[]", "2026-01-01"))
+            finally:
+                db.close()
+            store = ConversationStore(path)
+            self.assertEqual(store.get("a" * 32)["model"], "auto")
+            self.assertEqual(store.get("a" * 32)["messages"][0]["content"], "Oi")
+
     def test_exclusao_persiste_e_preserva_outros(self):
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "history.db"

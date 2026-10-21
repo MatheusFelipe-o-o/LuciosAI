@@ -15,7 +15,11 @@ class ConversationStore:
         with self.connect() as db:
             db.execute("""CREATE TABLE IF NOT EXISTS conversations (
                 id TEXT PRIMARY KEY, title TEXT NOT NULL, messages TEXT NOT NULL,
-                context TEXT NOT NULL, updated TEXT NOT NULL)""")
+                context TEXT NOT NULL, updated TEXT NOT NULL,
+                model TEXT NOT NULL DEFAULT 'auto')""")
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(conversations)")}
+            if "model" not in columns:
+                db.execute("ALTER TABLE conversations ADD COLUMN model TEXT NOT NULL DEFAULT 'auto'")
 
     @contextmanager
     def connect(self):
@@ -27,12 +31,14 @@ class ConversationStore:
         finally:
             db.close()
 
-    def create(self):
+    def create(self, model="auto"):
         identifier = uuid4().hex
         now = datetime.now(timezone.utc).isoformat()
         with self.connect() as db:
-            db.execute("INSERT INTO conversations VALUES (?, ?, ?, ?, ?)",
-                       (identifier, "Nova conversa", "[]", "[]", now))
+            db.execute("""INSERT INTO conversations
+                       (id, title, messages, context, updated, model)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                       (identifier, "Nova conversa", "[]", "[]", now, model))
         return self.get(identifier)
 
     def get(self, identifier):
@@ -58,6 +64,13 @@ class ConversationStore:
             if deleted.rowcount != 1:
                 raise ValueError("Conversa não encontrada.")
 
+    def set_model(self, identifier, model):
+        with self.connect() as db:
+            changed = db.execute("UPDATE conversations SET model = ? WHERE id = ?",
+                                 (model, identifier))
+            if changed.rowcount != 1:
+                raise ValueError("Conversa não encontrada.")
+
     def save(self, conversation, context):
         messages = conversation["messages"]
         first = next((m["content"] for m in messages if m["role"] == "user"), "Nova conversa")
@@ -67,3 +80,4 @@ class ConversationStore:
                        (title, json.dumps(messages, ensure_ascii=False),
                         json.dumps(context, ensure_ascii=False), datetime.now(timezone.utc).isoformat(),
                         conversation["id"]))
+        conversation["title"] = title

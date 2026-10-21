@@ -2,6 +2,7 @@
 const $ = (id) => document.getElementById(id);
 const token = document.querySelector('meta[name="lucios-token"]').content;
 let currentId = null, recent = [], busy = true, labBusy = false, toastTimer;
+let activeConversation = null, selectedModel = "auto", editing = false, defaultModel = "Modelo local";
 const promptInput = $("prompt"), messages = $("messages");
 
 async function api(path, payload) {
@@ -25,9 +26,16 @@ function toast(text, url) {
 }
 function setBusy(value) {
   busy = value;
-  for (const id of ["sendBtn", "newBtn"]) $(id).disabled = value;
-  promptInput.disabled = value;
+  for (const id of ["sendBtn", "newBtn", "modelBtn"]) $(id).disabled = value;
+  promptInput.disabled = value || editing;
+  $("sendBtn").disabled = value || editing;
   $("endBtn").disabled = value || !currentId || !messages.children.length;
+  messages.querySelectorAll?.("[data-turn-action]").forEach(button => {
+    button.disabled = value || editing || button.dataset.boundary === "true";
+  });
+  messages.querySelectorAll?.(".edit-form button, .edit-form textarea").forEach(control => {
+    control.disabled = value;
+  });
   $("activity").classList.toggle("busy", value);
   $("status").textContent = value ? "Lucios está pensando…" : "Pronto para conversar";
 }
@@ -42,6 +50,89 @@ function addMessage(role, text) {
   const content = document.createElement("div"); content.className = "markdown-body";
   if (role === "assistant") renderMarkdown(text, content); else content.textContent = text;
   article.append(header, content); messages.append(article); return article;
+}
+function turnButton(label, glyph, callback) {
+  const button = document.createElement("button");
+  button.type = "button"; button.className = "turn-action";
+  button.textContent = glyph; button.title = label;
+  button.setAttribute("aria-label", label);
+  button.setAttribute("data-turn-action", "");
+  button.disabled = busy;
+  button.addEventListener("click", callback);
+  return button;
+}
+function renderConversation() {
+  messages.replaceChildren();
+  if (!activeConversation) return;
+  const entries = activeConversation.messages;
+  for (let i = 0; i < entries.length; i++) {
+    const item = entries[i];
+    const article = addMessage(item.role, item.content);
+    if (!activeConversation.editable || i < entries.length - 2) continue;
+    const actions = document.createElement("div"); actions.className = "message-actions";
+    if (item.role === "user") {
+      actions.append(turnButton("Editar este prompt", "✎", beginEdit));
+    } else if (item.role === "assistant") {
+      actions.append(turnButton("Tentar outra resposta", "↻", () => mutateTurn("/api/retry")));
+      const alternatives = item.alternatives || [{content: item.content, model: null}];
+      const chosen = item.selected || 0;
+      if (alternatives.length > 1) {
+        const prev = turnButton("Resposta anterior", "‹", () => mutateTurn("/api/select-answer", {index: chosen - 1}));
+        prev.dataset.boundary = String(chosen === 0);
+        prev.disabled = busy || chosen === 0;
+        const count = document.createElement("span"); count.className = "answer-count";
+        count.textContent = `${chosen + 1} de ${alternatives.length}`;
+        const next = turnButton("Próxima resposta", "›", () => mutateTurn("/api/select-answer", {index: chosen + 1}));
+        next.dataset.boundary = String(chosen === alternatives.length - 1);
+        next.disabled = busy || chosen === alternatives.length - 1;
+        actions.append(prev, count, next);
+      }
+      const model = alternatives[chosen]?.model;
+      if (model) {
+        const tag = document.createElement("span"); tag.className = "answer-model";
+        tag.textContent = model; tag.title = `Resposta gerada por ${model}`; actions.append(tag);
+      }
+    }
+    article.append(actions);
+  }
+  showWelcome(!entries.length);
+  scrollChat();
+}
+async function mutateTurn(path, extra = {}) {
+  if (busy || !activeConversation?.editable || (editing && path !== "/api/edit")) return false;
+  const turn = activeConversation.editable_turn;
+  setBusy(true); renderRecent();
+  try {
+    const data = await api(path, {conversation_id: currentId, turn, ...extra});
+    activeConversation = data.conversation;
+    editing = false;
+    renderConversation();
+    $("chatTitle").textContent = activeConversation.title;
+    await refreshRecent().catch(() => toast("Resposta salva. Não foi possível atualizar Recentes."));
+    return true;
+  } catch (error) { toast(error.message); return false; }
+  finally { setBusy(false); renderRecent(); }
+}
+function beginEdit() {
+  if (busy || editing || !activeConversation?.editable) return;
+  editing = true; setBusy(false);
+  const article = messages.children[activeConversation.editable_turn];
+  const content = article.children[1];
+  const form = document.createElement("form"); form.className = "edit-form";
+  const input = document.createElement("textarea"); input.value = activeConversation.messages.at(-2).content;
+  input.maxLength = 16000; input.setAttribute("aria-label", "Editar prompt enviado");
+  const buttons = document.createElement("div"); buttons.className = "edit-buttons";
+  const cancel = document.createElement("button"); cancel.type = "button"; cancel.textContent = "Cancelar";
+  cancel.addEventListener("click", () => { editing = false; renderConversation(); setBusy(false); promptInput.focus(); });
+  const save = document.createElement("button"); save.type = "submit"; save.textContent = "Salvar e gerar resposta";
+  buttons.append(cancel, save); form.append(input, buttons); content.replaceChildren(form);
+  form.addEventListener("submit", async event => {
+    event.preventDefault();
+    const text = input.value.trim();
+    if (!text) { toast("Escreva um prompt antes de salvar."); return; }
+    await mutateTurn("/api/edit", {message: text});
+  });
+  input.focus();
 }
 function typing() {
   const article = document.createElement("div"); article.className = "typing";
@@ -104,11 +195,63 @@ async function deleteConversation(item) {
 }
 async function refreshRecent() {
   const data = await api("/api/conversations"); recent = data.conversations;
-  $("model").textContent = data.model; $("model").title = data.model;
+  defaultModel = data.model;
+  updateModelLabel();
   const selected = recent.find(c => c.id === currentId);
   $("chatTitle").textContent = selected ? selected.title : "Nova conversa";
   renderRecent();
 }
+function updateModelLabel() {
+  const label = selectedModel === "auto" ? "Automático" : selectedModel;
+  $("modelName").textContent = label;
+  $("modelBtn").title = selectedModel === "auto"
+    ? `Seleção automática · padrão ${defaultModel}` : `Modelo selecionado: ${selectedModel}`;
+  $("model").textContent = selectedModel === "auto" ? `Auto · ${defaultModel}` : selectedModel;
+  $("model").title = $("modelBtn").title;
+}
+function closeModelMenu() {
+  $("modelMenu").hidden = true;
+  $("modelBtn").setAttribute("aria-expanded", "false");
+}
+function modelOption(name, caption) {
+  const button = document.createElement("button"); button.type = "button";
+  button.className = "model-option"; button.textContent = name === "auto" ? "Automático" : name;
+  button.setAttribute("aria-current", String(selectedModel === name));
+  if (caption) {
+    const hint = document.createElement("small"); hint.textContent = caption; button.append(hint);
+  }
+  button.addEventListener("click", async () => {
+    if (busy) return;
+    closeModelMenu();
+    if (name === selectedModel) return;
+    if (currentId) {
+      setBusy(true); renderRecent();
+      try { await api("/api/model", {conversation_id: currentId, model: name}); }
+      catch (error) { toast(error.message); setBusy(false); renderRecent(); return; }
+      finally { setBusy(false); renderRecent(); }
+    }
+    selectedModel = name;
+    if (activeConversation) activeConversation.model = name;
+    updateModelLabel();
+  });
+  return button;
+}
+$("modelBtn").addEventListener("click", async () => {
+  if (busy) return;
+  if (!$("modelMenu").hidden) { closeModelMenu(); return; }
+  $("modelMenu").hidden = false;
+  $("modelBtn").setAttribute("aria-expanded", "true");
+  $("modelOptions").replaceChildren(modelOption("auto", "Escolha do orquestrador"));
+  try {
+    const data = await api("/api/models");
+    if (!data.available) throw new Error("Ollama local indisponível. O modo Automático continua disponível.");
+    for (const name of data.models) $("modelOptions").append(modelOption(name));
+    if (!data.models.length) {
+      const empty = document.createElement("div"); empty.className = "model-unavailable";
+      empty.textContent = "Nenhum modelo instalado."; $("modelOptions").append(empty);
+    }
+  } catch (error) { toast(error.message); }
+});
 function sidebar(open) {
   const mobile = window.matchMedia("(max-width: 760px)").matches;
   document.body.classList.toggle("mobile-open", mobile && open);
@@ -121,12 +264,14 @@ function sidebar(open) {
 }
 async function openConversation(id) {
   if (busy) return;
+  closeModelMenu();
   setBusy(true); renderRecent();
   try {
     const data = await api(`/api/conversation?id=${encodeURIComponent(id)}`);
-    currentId = data.id; messages.replaceChildren();
-    for (const item of data.messages) addMessage(item.role, item.content);
-    $("chatTitle").textContent = data.title; showWelcome(!data.messages.length);
+    currentId = data.id; activeConversation = data;
+    selectedModel = data.model || "auto"; updateModelLabel();
+    editing = false; renderConversation();
+    $("chatTitle").textContent = data.title;
     promptInput.value = ""; resizeInput();
     if (window.matchMedia("(max-width: 760px)").matches) sidebar(false);
     scrollChat();
@@ -135,7 +280,9 @@ async function openConversation(id) {
 }
 function newChat() {
   if (busy) return;
-  currentId = null; messages.replaceChildren(); showWelcome(true);
+  currentId = null; activeConversation = null; editing = false;
+  selectedModel = "auto"; updateModelLabel(); closeModelMenu();
+  messages.replaceChildren(); showWelcome(true);
   $("chatTitle").textContent = "Nova conversa"; promptInput.value = ""; resizeInput();
   setBusy(false); renderRecent();
   if (window.matchMedia("(max-width: 760px)").matches) sidebar(false);
@@ -149,9 +296,15 @@ $("chatForm").addEventListener("submit", async (event) => {
   const userMessage = addMessage("user", text); const pending = typing();
   promptInput.value = ""; resizeInput();
   try {
-    if (!currentId) currentId = (await api("/api/new", {})).id;
+    if (!currentId) currentId = (await api("/api/new", {model: selectedModel})).id;
     const data = await api("/api/chat", {message: text, conversation_id: currentId});
-    pending.remove(); addMessage("assistant", data.reply); scrollChat();
+    pending.remove();
+    if (data.conversation) {
+      activeConversation = data.conversation;
+      renderConversation();
+    } else {
+      addMessage("assistant", data.reply); scrollChat();
+    }
     await refreshRecent().catch(() => toast("Resposta salva. Não foi possível atualizar a lista de recentes."));
   } catch (error) {
     pending.remove(); userMessage.remove(); promptInput.value = text; resizeInput();
@@ -172,7 +325,10 @@ $("closeSidebar").addEventListener("click", () => { sidebar(false); $("menuBtn")
 $("scrim").addEventListener("click", () => { sidebar(false); $("menuBtn").focus(); });
 document.addEventListener("keydown", (event) => {
   if (event.altKey && event.key.toLowerCase() === "n") { event.preventDefault(); newChat(); }
-  if (event.key === "Escape") { sidebar(false); $("menuBtn").focus(); }
+  if (event.key === "Escape") {
+    if (!$("modelMenu").hidden) { closeModelMenu(); $("modelBtn").focus(); }
+    else { sidebar(false); $("menuBtn").focus(); }
+  }
 });
 window.matchMedia("(max-width: 760px)").addEventListener("change", event => sidebar(!event.matches));
 document.querySelectorAll("[data-prompt]").forEach(button => button.addEventListener("click", () => {

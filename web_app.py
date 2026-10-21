@@ -6,6 +6,8 @@ import secrets
 import threading
 from urllib.parse import parse_qs, urlsplit
 
+import ollama
+
 from Agent import LuciosAgent
 from conversations import ConversationStore
 from orchestrator import Estado
@@ -15,6 +17,70 @@ PORT = 8000
 ROOT = Path(__file__).resolve().parent
 agent = LuciosAgent()
 agent_lock = threading.Lock()
+
+
+class ChatActionError(ValueError):
+    def __init__(self, message, status=400):
+        super().__init__(message)
+        self.status = status
+
+
+def modelos_instalados():
+    client = ollama.Client(host="http://127.0.0.1:11434", timeout=3)
+    try:
+        return [item.model for item in client.list().models if item.model]
+    finally:
+        client._client.close()
+
+
+def validar_modelo(model):
+    if not isinstance(model, str) or not model or len(model) > 150:
+        raise ChatActionError("Selecione um modelo válido.")
+    if model != "auto":
+        try:
+            installed = modelos_instalados()
+        except Exception as error:
+            raise ChatActionError("Ollama indisponível. Confira o serviço local.", 503) from error
+        if model not in installed:
+            raise ChatActionError("Modelo não instalado no Ollama local.")
+    return model
+
+
+def resposta_com_modelo(message, model):
+    if model == "auto":
+        return agent.chat(message)
+    validar_modelo(model)
+    return agent.chat(message, modelo_resposta=model)
+
+
+def turno_editavel(item):
+    messages, context = item["messages"], item["context"]
+    return (len(messages) >= 2 and len(context) >= 2
+            and messages[-2]["role"] == context[-2]["role"] == "user"
+            and messages[-1]["role"] == context[-1]["role"] == "assistant"
+            and messages[-2]["content"] == context[-2]["content"]
+            and messages[-1]["content"] == context[-1]["content"])
+
+
+def publico(item):
+    item["editable"] = turno_editavel(item)
+    item["editable_turn"] = len(item["messages"]) - 2 if item["editable"] else None
+    item.pop("context", None)
+    for message in item["messages"]:
+        if message["role"] == "assistant" and "alternatives" not in message:
+            message["alternatives"] = [{"content": message["content"], "model": None}]
+            message["selected"] = 0
+    return item
+
+
+def ultima_resposta(item):
+    if not turno_editavel(item):
+        raise ChatActionError("Esse turno já foi concluído; só o último pode ser alterado.", 409)
+    answer = item["messages"][-1]
+    if "alternatives" not in answer:
+        answer["alternatives"] = [{"content": answer["content"], "model": None}]
+        answer["selected"] = 0
+    return answer
 
 
 class LuciosServer(ThreadingHTTPServer):
@@ -72,11 +138,16 @@ class LuciosWebHandler(BaseHTTPRequestHandler):
         if url.path == "/api/conversations":
             self.send_json({"conversations": self.server.store.list(), "model": agent.model_name})
             return
+        if url.path == "/api/models":
+            try:
+                self.send_json({"models": modelos_instalados(), "available": True})
+            except Exception:
+                self.send_json({"models": [], "available": False})
+            return
         if url.path == "/api/conversation":
             try:
                 item = self.server.store.get(parse_qs(url.query).get("id", [None])[0])
-                item.pop("context")
-                self.send_json(item)
+                self.send_json(publico(item))
             except ValueError as error:
                 self.send_json({"error": str(error)}, 404)
             return
@@ -96,7 +167,14 @@ class LuciosWebHandler(BaseHTTPRequestHandler):
             return
         try:
             if self.path == "/api/new":
-                self.send_json(self.server.store.create())
+                self.send_json(publico(self.server.store.create(
+                    validar_modelo(payload.get("model", "auto")))))
+                return
+            if self.path == "/api/model":
+                model = validar_modelo(payload.get("model"))
+                with agent_lock:
+                    self.server.store.set_model(payload.get("conversation_id"), model)
+                self.send_json({"model": model})
                 return
             if self.path == "/api/delete":
                 identifier = payload.get("conversation_id")
@@ -112,6 +190,9 @@ class LuciosWebHandler(BaseHTTPRequestHandler):
                     self.send_json({"url": self.server.open_lab()})
                 except (ImportError, OSError):
                     self.send_json({"error": "Nao foi possivel abrir o Lab. Instale: python -m pip install -r benchmarks/requirements.txt"}, 503)
+                return
+            if self.path in ("/api/retry", "/api/edit", "/api/select-answer"):
+                self.mutate_last_turn(payload)
                 return
             if self.path not in ("/api/chat", "/api/clear", "/api/end"):
                 self.send_json({"error": "Rota nao encontrada."}, 404)
@@ -135,7 +216,9 @@ class LuciosWebHandler(BaseHTTPRequestHandler):
                     success = agent.estado_encerramento != "falhou"
                     status = 200 if success else 502
                 else:
-                    reply = agent.chat(message if self.path == "/api/chat" else "limpar")
+                    reply = (resposta_com_modelo(message, conversation["model"])
+                             if self.path == "/api/chat" and conversation is not None
+                             else agent.chat(message if self.path == "/api/chat" else "limpar"))
                     state = agent.ultimo_resultado.estado
                     success = state == Estado.CONCLUIDO
                     status = 200 if success else (409 if state == Estado.CANCELADO else 502)
@@ -143,13 +226,76 @@ class LuciosWebHandler(BaseHTTPRequestHandler):
                     if self.path == "/api/chat":
                         conversation["messages"].extend([
                             {"role": "user", "content": message.strip()},
-                            {"role": "assistant", "content": reply}])
+                            {"role": "assistant", "content": reply,
+                             "alternatives": [{"content": reply,
+                                               "model": agent.ultimo_resultado.decisao.modelo}],
+                             "selected": 0}])
                     self.server.store.save(conversation, agent.conversa)
-            self.send_json({"reply" if success else "error": reply}, status)
+            response = {"reply" if success else "error": reply}
+            if conversation is not None and success:
+                response["conversation"] = publico(conversation)
+            self.send_json(response, status)
+        except ChatActionError as error:
+            self.send_json({"error": str(error)}, error.status)
         except ValueError as error:
             self.send_json({"error": str(error)}, 404)
         except Exception:
             self.send_json({"error": "Nao foi possivel concluir. Confira o armazenamento local e tente novamente."}, 500)
+
+    def mutate_last_turn(self, payload):
+        action = self.path
+        identifier = payload.get("conversation_id")
+        if action == "/api/edit":
+            message = payload.get("message")
+            if (not isinstance(message, str) or not message.strip()
+                    or len(message) > agent.configuracao.limite_entrada):
+                raise ChatActionError("Mensagem inválida ou acima do limite de tamanho.")
+            message = message.strip()
+        if action == "/api/select-answer":
+            index = payload.get("index")
+            if type(index) is not int:
+                raise ChatActionError("Escolha uma versão válida.")
+        with agent_lock:
+            item = self.server.store.get(identifier)
+            turn = payload.get("turn")
+            if type(turn) is not int or turn != len(item["messages"]) - 2:
+                raise ChatActionError("Esse prompt já possui uma continuação.", 409)
+            answer = ultima_resposta(item)
+            if action == "/api/select-answer":
+                if not 0 <= index < len(answer["alternatives"]):
+                    raise ChatActionError("Versão não encontrada.")
+                answer["selected"] = index
+                answer["content"] = answer["alternatives"][index]["content"]
+                item["context"][-1] = {"role": "assistant", "content": answer["content"]}
+                agent.clear_memory()
+                agent.conversa = item["context"]
+            else:
+                text = message if action == "/api/edit" else item["messages"][-2]["content"]
+                agent.clear_memory()
+                agent.conversa = item["context"][:-2]
+                try:
+                    reply = resposta_com_modelo(text, item["model"])
+                except Exception:
+                    agent.conversa = item["context"]
+                    raise
+                state = agent.ultimo_resultado.estado
+                if state != Estado.CONCLUIDO:
+                    agent.conversa = item["context"]
+                    self.send_json({"error": reply}, 409 if state == Estado.CANCELADO else 502)
+                    return
+                alternative = {"content": reply, "model": agent.ultimo_resultado.decisao.modelo}
+                if action == "/api/edit":
+                    item["messages"][-2]["content"] = text
+                    answer["alternatives"] = [alternative]
+                    answer["selected"] = 0
+                else:
+                    answer["alternatives"].append(alternative)
+                    answer["selected"] = len(answer["alternatives"]) - 1
+                answer["content"] = reply
+                item["context"] = agent.conversa
+            self.server.store.save(item, item["context"])
+            self.server.active_conversation_id = identifier
+            self.send_json({"conversation": publico(item)})
 
     def read_json(self):
         content_length = int(self.headers.get("Content-Length", "0"))

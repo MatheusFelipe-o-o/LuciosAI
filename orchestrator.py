@@ -256,7 +256,7 @@ class Orquestrador:
         return replace(decisao, motivo="Fallback: modelo complexo não instalado.")
 
     def executar(self, pedido, responder: Callable, limpar: Callable,
-                 cancelar: Event | None = None) -> Resultado:
+                 cancelar: Event | None = None, modelo_resposta: str | None = None) -> Resultado:
         resultado = Resultado()
         contexto = ContextoExecucao(self.config, resultado, self._chamar_modelo,
                                    cancelar, self._relogio)
@@ -272,7 +272,11 @@ class Orquestrador:
             with contexto.medir("classificacao_tarefa"):
                 decisao = self.classificar(texto)
             with contexto.medir("selecao_modelo"):
-                resultado.decisao = self._selecionar_modelo(decisao, contexto)
+                if modelo_resposta is not None and decisao.estrategia == "conversar":
+                    resultado.decisao = replace(decisao, modelo=modelo_resposta,
+                                               motivo="Modelo selecionado na conversa.")
+                else:
+                    resultado.decisao = self._selecionar_modelo(decisao, contexto)
             contexto.verificar_limites()
             resultado.transicionar(Estado.EXECUTANDO)
             with contexto.medir("execucao"):

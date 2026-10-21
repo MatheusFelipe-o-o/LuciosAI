@@ -106,6 +106,90 @@ class WebTests(unittest.TestCase):
         response.read()
         self.assertEqual(self.get("/api/conversation?id=" + identifier)[0], 200)
 
+    def test_modelo_por_conversa_e_catalogo_validado(self):
+        with patch.object(web_app, "modelos_instalados", return_value=["small:latest", "large:latest"]):
+            self.assertEqual(json.loads(self.get("/api/models")[1])["models"],
+                             ["small:latest", "large:latest"])
+            identifier = self.post("/api/new", {"model": "large:latest"})[1]["id"]
+            self.assertEqual(self.post(corpo={"message": "Olá", "conversation_id": identifier})[0], 200)
+            self.assertEqual(self.cliente.chat.call_args.kwargs["model"], "large:latest")
+            self.assertEqual(self.servidor.store.get(identifier)["model"], "large:latest")
+            self.assertEqual(self.post("/api/model", {"conversation_id": identifier,
+                                                        "model": "small:latest"})[0], 200)
+            self.assertEqual(self.post("/api/model", {"conversation_id": identifier,
+                                                        "model": "inventado:latest"})[0], 400)
+            self.assertEqual(self.servidor.store.get(identifier)["model"], "small:latest")
+
+    def test_nova_resposta_navegacao_e_bloqueio_apos_proximo_prompt(self):
+        identifier = self.post("/api/new")[1]["id"]
+        self.cliente.chat.side_effect = [
+            {"message": {"content": "Primeira"}},
+            {"message": {"content": "Segunda"}},
+            {"message": {"content": "Continuação"}},
+        ]
+        self.assertEqual(self.post(corpo={"message": "Pergunta", "conversation_id": identifier})[0], 200)
+        status, data = self.post("/api/retry", {"conversation_id": identifier, "turn": 0})
+        self.assertEqual(status, 200)
+        answer = data["conversation"]["messages"][-1]
+        self.assertEqual([a["content"] for a in answer["alternatives"]], ["Primeira", "Segunda"])
+        self.assertEqual(answer["selected"], 1)
+        self.assertEqual(self.post("/api/select-answer", {"conversation_id": identifier,
+                                                           "index": 0, "turn": 0})[0], 200)
+        self.assertEqual(self.servidor.store.get(identifier)["context"][-1]["content"], "Primeira")
+        self.assertEqual(self.post(corpo={"message": "Depois", "conversation_id": identifier})[0], 200)
+        sent = [m["content"] for m in self.cliente.chat.call_args.kwargs["messages"]]
+        self.assertIn("Primeira", sent)
+        self.assertNotIn("Segunda", sent)
+        self.assertEqual(self.post("/api/select-answer", {"conversation_id": identifier,
+                                                           "index": 0, "turn": 0})[0], 409)
+        self.assertEqual(self.post("/api/retry", {"conversation_id": identifier,
+                                                 "turn": 0})[0], 409)
+        self.assertEqual(self.servidor.store.get(identifier)["messages"][1]["content"], "Primeira")
+
+    def test_edicao_substitui_ultimo_prompt_somente_apos_sucesso(self):
+        identifier = self.post("/api/new")[1]["id"]
+        self.cliente.chat.return_value = {"message": {"content": "Antiga"}}
+        self.post(corpo={"message": "Original", "conversation_id": identifier})
+        self.cliente.chat.side_effect = RuntimeError("offline")
+        self.assertEqual(self.post("/api/edit", {"conversation_id": identifier,
+                                                 "message": "Revisada", "turn": 0})[0], 502)
+        self.assertEqual(self.servidor.store.get(identifier)["messages"][-2]["content"], "Original")
+        self.cliente.chat.side_effect = None
+        self.cliente.chat.return_value = {"message": {"content": "Nova"}}
+        status, data = self.post("/api/edit", {"conversation_id": identifier,
+                                                "message": "Revisada", "turn": 0})
+        self.assertEqual(status, 200)
+        self.assertEqual([m["content"] for m in data["conversation"]["messages"][-2:]],
+                         ["Revisada", "Nova"])
+        self.assertEqual(self.servidor.store.get(identifier)["title"], "Revisada")
+        self.assertEqual(self.servidor.store.get(identifier)["context"][-2]["content"], "Revisada")
+
+    def test_historico_legado_oferece_uma_versao_sem_perder_contexto(self):
+        item = self.servidor.store.create()
+        item["messages"] = [{"role": "user", "content": "Antiga pergunta"},
+                            {"role": "assistant", "content": "Antiga resposta"}]
+        self.servidor.store.save(item, item["messages"])
+        loaded = json.loads(self.get("/api/conversation?id=" + item["id"])[1])
+        self.assertEqual(loaded["model"], "auto")
+        self.assertEqual(loaded["messages"][-1]["alternatives"][0]["content"], "Antiga resposta")
+        self.assertEqual(loaded["editable_turn"], 0)
+        self.assertEqual(self.post("/api/retry", {"conversation_id": item["id"],
+                                                 "turn": 0})[0], 200)
+        self.assertEqual(len(self.servidor.store.get(item["id"])["messages"][-1]["alternatives"]), 2)
+
+    def test_modelo_retirado_nao_substitui_resposta_anterior(self):
+        with patch.object(web_app, "modelos_instalados", return_value=["small:latest"]):
+            identifier = self.post("/api/new", {"model": "small:latest"})[1]["id"]
+        self.cliente.chat.return_value = {"message": {"content": "Resposta segura"}}
+        with patch.object(web_app, "modelos_instalados", return_value=["small:latest"]):
+            self.post(corpo={"message": "Pergunta", "conversation_id": identifier})
+        with patch.object(web_app, "modelos_instalados", return_value=[]):
+            self.assertEqual(self.post("/api/retry", {"conversation_id": identifier,
+                                                     "turn": 0})[0], 400)
+        saved = self.servidor.store.get(identifier)
+        self.assertEqual(saved["messages"][-1]["content"], "Resposta segura")
+        self.assertEqual(len(saved["messages"][-1]["alternatives"]), 1)
+
     def test_falha_nao_entra_no_historico(self):
         identifier = self.post("/api/new")[1]["id"]
         self.cliente.chat.side_effect = RuntimeError("offline")
