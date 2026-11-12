@@ -45,7 +45,9 @@ class FileActionTests(unittest.TestCase):
     def test_listar_buscar_ler_e_copiar(self):
         (self.root / "nota.md").write_text("Olá", encoding="utf-8")
         self.assertIn("nota.md", self.actions.execute(self.plan("list", ".")))
-        self.assertIn("nota.md", self.actions.execute(self.plan("search", ".", query="not")))
+        found = self.actions.execute(self.plan("search", ".", query="not"))
+        self.assertIn("1 arquivo(s)", found)
+        self.assertIn("nota.md", found)
         self.assertEqual(self.actions.execute(self.plan("read", "nota.md")), "Olá")
         self.actions.execute(self.plan("copy", "nota.md", target="copia.md"))
         self.assertEqual((self.root / "copia.md").read_text(encoding="utf-8"), "Olá")

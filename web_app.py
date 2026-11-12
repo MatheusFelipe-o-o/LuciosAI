@@ -23,7 +23,7 @@ agent_lock = threading.Lock()
 FILES_ROOT = Path(os.getenv("LUCIOS_FILES_ROOT", str(Path.home() / "Documents")))
 
 
-def interpretar_acao(message, model, history=None):
+def interpretar_acao(message, model, history=None, root=None):
     """O modelo propõe JSON; a validação e a execução pertencem ao servidor."""
     client = ollama.Client(host="http://127.0.0.1:11434", timeout=45)
     try:
@@ -34,6 +34,9 @@ def interpretar_acao(message, model, history=None):
             messages=[
                 {"role": "system", "content": (
                     "Interprete o pedido como UMA operação de arquivo dentro da pasta autorizada. "
+                    f"A pasta autorizada é {root}. O caminho '.' representa essa pasta; "
+                    "se o usuário mencionar o nome da própria pasta autorizada, use '.' "
+                    "e não repita esse nome no caminho relativo. "
                     "Responda somente JSON com operation, source, target, content, query, interpretation. "
                     "Operações: list, search, read, mkdir, create, edit, copy, move, rename, delete. "
                     "Caminhos relativos. Para search, source é a pasta e query é o nome/trecho buscado. "
@@ -341,7 +344,8 @@ class LuciosWebHandler(BaseHTTPRequestHandler):
             if identifier in self.server.pending_actions:
                 raise ChatActionError("Responda à confirmação anterior primeiro.", 409)
             try:
-                plan = interpretar_acao(message, item["model"], item["messages"])
+                plan = interpretar_acao(message, item["model"], item["messages"],
+                                       str(self.server.file_actions.root))
             except Exception as error:
                 raise ChatActionError("Não foi possível interpretar a ação com o modelo local.", 502) from error
             if not isinstance(plan, dict):

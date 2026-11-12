@@ -147,7 +147,11 @@ class FileActions:
             names = sorted(str(p.relative_to(self.root)) for p in source.rglob("*")
                            if p.is_file() and not p.is_symlink() and _inside(self.root, p.resolve())
                            and proposal.query in p.name.casefold())
-            return "\n".join(names[:100]) or "Nenhum arquivo encontrado."
+            if not names:
+                return "Nenhum arquivo encontrado."
+            listing = "\n".join(names[:100])
+            extra = f"\n… e mais {len(names) - 100}." if len(names) > 100 else ""
+            return f"{len(names)} arquivo(s) encontrado(s):\n{listing}{extra}"
         if op == "read":
             return source.read_text(encoding="utf-8")[:MAX_TEXT]
         if op == "mkdir":
