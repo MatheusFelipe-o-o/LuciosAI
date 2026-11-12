@@ -40,6 +40,11 @@ def interpretar_acao(message, model, history=None, root=None):
                     "Responda somente JSON com operation, source, target, content, query, interpretation. "
                     "Operações: list, search, read, mkdir, create, edit, copy, move, rename, delete. "
                     "Caminhos relativos. Para search, source é a pasta e query é o nome/trecho buscado. "
+                    "Para contar ou listar candidatos, use search. Para achar UM arquivo, "
+                    "inclusive 'o mais atual', use read com source como pasta de busca e query "
+                    "como nome aproximado; o usuário escolherá entre candidatos ambíguos. "
+                    "Para edit/copy/move/rename/delete com origem aproximada, use source "
+                    "como pasta de busca e query como nome aproximado. "
                     "target, content e query devem ser null quando não usados. "
                     "Não invente conteúdo ou caminhos ausentes: nesse caso responda "
                     "{\"operation\":\"clarify\",\"interpretation\":\"pergunta objetiva\"}. "
@@ -157,6 +162,7 @@ class LuciosServer(ThreadingHTTPServer):
         self.active_conversation_id = None
         self.file_actions = FileActions(FILES_ROOT) if FILES_ROOT.is_dir() else None
         self.pending_actions = {}
+        self.pending_selections = {}
 
     def open_lab(self):
         # Optional package: chat works without benchmark dependencies.
@@ -225,7 +231,12 @@ class LuciosWebHandler(BaseHTTPRequestHandler):
                     self.send_json({"proposal": pending["public"]})
                 else:
                     self.server.pending_actions.pop(identifier, None)
-                    self.send_json({"proposal": None})
+                    selection = self.server.pending_selections.get(identifier)
+                    if selection and selection["expires"] > time.monotonic():
+                        self.send_json({"selection": selection["public"]})
+                    else:
+                        self.server.pending_selections.pop(identifier, None)
+                        self.send_json({"proposal": None, "selection": None})
             return
         self.send_json({"error": "Rota nao encontrada."}, 404)
 
@@ -254,8 +265,11 @@ class LuciosWebHandler(BaseHTTPRequestHandler):
                 return
             if self.path == "/api/delete":
                 identifier = payload.get("conversation_id")
+                if not isinstance(identifier, str) or len(identifier) != 32:
+                    raise ValueError("Conversa não encontrada.")
                 with agent_lock:
                     self.server.pending_actions.pop(identifier, None)
+                    self.server.pending_selections.pop(identifier, None)
                     self.server.store.delete(identifier)
                     if self.server.active_conversation_id == identifier:
                         agent.clear_memory()
@@ -267,6 +281,9 @@ class LuciosWebHandler(BaseHTTPRequestHandler):
                 return
             if self.path == "/api/files/decide":
                 self.decide_file_action(payload)
+                return
+            if self.path == "/api/files/select":
+                self.select_file_candidate(payload)
                 return
             if self.path == "/api/chat-stream":
                 self.stream_chat(payload)
@@ -341,7 +358,7 @@ class LuciosWebHandler(BaseHTTPRequestHandler):
             raise ChatActionError("Descreva uma ação em arquivos com até 4 mil caracteres.")
         with agent_lock:
             item = self.server.store.get(identifier)
-            if identifier in self.server.pending_actions:
+            if identifier in self.server.pending_actions or identifier in self.server.pending_selections:
                 raise ChatActionError("Responda à confirmação anterior primeiro.", 409)
             try:
                 plan = interpretar_acao(message, item["model"], item["messages"],
@@ -353,6 +370,28 @@ class LuciosWebHandler(BaseHTTPRequestHandler):
             if plan.get("operation") == "clarify":
                 self.send_json({"clarification": str(plan.get("interpretation", "Detalhe a ação desejada."))[:500]})
                 return
+            if plan.get("operation") in {"read", "edit", "copy", "move", "rename", "delete"} and plan.get("query"):
+                candidates = self.server.file_actions.find_candidates(plan.get("source"), plan["query"])
+                if not candidates:
+                    self.send_json({"clarification": "Não encontrei candidatos para esse nome na pasta autorizada."})
+                    return
+                if len(candidates) > 1:
+                    selection_id = secrets.token_urlsafe(24)
+                    public = {"id": selection_id, "interpretation": plan.get("interpretation", ""),
+                              "request": message.strip(), "query": plan["query"],
+                              "candidates": candidates[:30], "total": len(candidates)}
+                    self.server.pending_selections[identifier] = {
+                        "public": public, "plan": plan, "message": message.strip(),
+                        "fingerprints": [self.server.file_actions.fingerprint(c["path"])
+                                         for c in candidates[:30]],
+                        "updated": item["updated"], "expires": time.monotonic() + 600}
+                    self.send_json({"selection": public})
+                    return
+                plan["source"] = candidates[0]["path"]
+                plan.pop("query", None)
+            self.send_json({"proposal": self.make_file_proposal(identifier, item, plan, message)})
+
+    def make_file_proposal(self, identifier, item, plan, message):
             if plan.get("operation") == "edit" and plan.get("content") is None:
                 try:
                     original = self.server.file_actions.read_edit_source(plan.get("source"))
@@ -360,8 +399,7 @@ class LuciosWebHandler(BaseHTTPRequestHandler):
                 except (OSError, UnicodeError, ValueError) as error:
                     raise ChatActionError(f"Não foi possível preparar a edição: {error}", 400) from error
                 if "clarification" in edited:
-                    self.send_json({"clarification": str(edited["clarification"])[:500]})
-                    return
+                    raise ChatActionError(str(edited["clarification"])[:500])
                 plan["content"] = edited.get("content")
             proposal = self.server.file_actions.prepare(plan)
             proposal_id = secrets.token_urlsafe(24)
@@ -373,7 +411,38 @@ class LuciosWebHandler(BaseHTTPRequestHandler):
             self.server.pending_actions[identifier] = {
                 "proposal": proposal, "public": public, "message": message.strip(),
                 "updated": item["updated"], "expires": time.monotonic() + 600}
-            self.send_json({"proposal": public})
+            return public
+
+    def select_file_candidate(self, payload):
+        identifier, selection_id, index = (payload.get("conversation_id"),
+                                           payload.get("selection_id"), payload.get("index"))
+        with agent_lock:
+            pending = self.server.pending_selections.get(identifier)
+            if not pending or not secrets.compare_digest(str(selection_id), pending["public"]["id"]):
+                raise ChatActionError("Seleção expirada ou inválida.", 409)
+            if time.monotonic() > pending["expires"]:
+                self.server.pending_selections.pop(identifier, None)
+                raise ChatActionError("Seleção expirada.", 409)
+            item = self.server.store.get(identifier)
+            if item["updated"] != pending["updated"]:
+                self.server.pending_selections.pop(identifier, None)
+                raise ChatActionError("A conversa mudou. Faça uma nova busca.", 409)
+            if index is None:
+                self.server.pending_selections.pop(identifier, None)
+                self.send_json({"cancelled": True})
+                return
+            candidates = pending["public"]["candidates"]
+            if type(index) is not int or not 0 <= index < len(candidates):
+                raise ChatActionError("Escolha um arquivo da lista.")
+            if self.server.file_actions.fingerprint(candidates[index]["path"]) != pending["fingerprints"][index]:
+                self.server.pending_selections.pop(identifier, None)
+                raise ChatActionError("Esse arquivo mudou desde a busca. Faça uma nova busca.", 409)
+            plan = dict(pending["plan"])
+            plan["source"] = candidates[index]["path"]
+            plan.pop("query", None)
+            self.server.pending_selections.pop(identifier, None)
+            self.send_json({"proposal": self.make_file_proposal(
+                identifier, item, plan, pending["message"])})
 
     def stream_chat(self, payload):
         message = payload.get("message")

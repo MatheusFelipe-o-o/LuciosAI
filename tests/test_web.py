@@ -150,6 +150,37 @@ class WebTests(unittest.TestCase):
             self.assertEqual(self.post("/api/files/decide", {
                 "conversation_id": identifier, "proposal_id": proposal_id, "confirm": True})[0], 409)
 
+    def test_ambiguidade_exige_escolha_antes_da_confirmacao(self):
+        from file_actions import FileActions
+        with TemporaryDirectory() as folder:
+            original = self.servidor.file_actions
+            self.servidor.file_actions = FileActions(folder)
+            self.addCleanup(setattr, self.servidor, "file_actions", original)
+            (Path(folder) / "curriculo_2024.txt").write_text("Antigo", encoding="utf-8")
+            (Path(folder) / "CV_2026.txt").write_text("Novo", encoding="utf-8")
+            identifier = self.post("/api/new")[1]["id"]
+            plan = {"operation": "read", "source": ".", "query": "currículo",
+                    "target": None, "content": None,
+                    "interpretation": "Encontrar o currículo mais atual."}
+            with patch.object(web_app, "interpretar_acao", return_value=plan):
+                status, data = self.post("/api/files/prepare", {
+                    "conversation_id": identifier, "message": "Ache meu currículo mais atual"})
+            self.assertEqual(status, 200)
+            selection = data["selection"]
+            self.assertEqual(selection["total"], 2)
+            self.assertEqual(selection["candidates"][0]["path"], "CV_2026.txt")
+            self.assertEqual(self.servidor.store.get(identifier)["messages"], [])
+            status, chosen = self.post("/api/files/select", {
+                "conversation_id": identifier, "selection_id": selection["id"], "index": 0})
+            self.assertEqual(status, 200)
+            self.assertEqual(chosen["proposal"]["source"], "CV_2026.txt")
+            self.assertEqual(self.post("/api/files/select", {
+                "conversation_id": identifier, "selection_id": selection["id"], "index": 1})[0], 409)
+            status, answer = self.post("/api/files/decide", {
+                "conversation_id": identifier, "proposal_id": chosen["proposal"]["id"], "confirm": True})
+            self.assertEqual(status, 200)
+            self.assertEqual(answer["result"], "Novo")
+
     def test_isola_conversas_e_reabre_contexto(self):
         a = self.post("/api/new")[1]["id"]
         b = self.post("/api/new")[1]["id"]

@@ -3,7 +3,7 @@ const $ = (id) => document.getElementById(id);
 const token = document.querySelector('meta[name="lucios-token"]').content;
 let currentId = null, recent = [], busy = true, labBusy = false, toastTimer;
 let activeConversation = null, selectedModel = "auto", editing = false, defaultModel = "Modelo local";
-let fileMode = false, pendingProposal = null;
+let fileMode = false, pendingProposal = null, pendingSelection = null;
 const promptInput = $("prompt"), messages = $("messages");
 
 async function api(path, payload) {
@@ -58,8 +58,8 @@ function toast(text, url) {
 function setBusy(value) {
   busy = value;
   for (const id of ["sendBtn", "newBtn", "modelBtn", "fileModeBtn"]) $(id).disabled = value;
-  promptInput.disabled = value || editing || !!pendingProposal;
-  $("sendBtn").disabled = value || editing || !!pendingProposal;
+  promptInput.disabled = value || editing || !!pendingProposal || !!pendingSelection;
+  $("sendBtn").disabled = value || editing || !!pendingProposal || !!pendingSelection;
   $("endBtn").disabled = value || !currentId || !messages.children.length;
   messages.querySelectorAll?.("[data-turn-action]").forEach(button => {
     button.disabled = value || editing || button.dataset.boundary === "true";
@@ -167,6 +167,60 @@ function approvalCard(proposal, messageText) {
   messages.append(card); scrollChat(); title.focus();
   setBusy(false);
 }
+function selectionCard(selection, messageText) {
+  pendingSelection = selection;
+  showWelcome(false);
+  if (messageText) addMessage("user", messageText);
+  const card = document.createElement("section"); card.className = "approval-card selection-card";
+  card.setAttribute("aria-labelledby", "selection-title");
+  const eyebrow = document.createElement("div"); eyebrow.className = "approval-eyebrow";
+  eyebrow.textContent = "Preciso da sua escolha";
+  const title = document.createElement("h2"); title.id = "selection-title"; title.tabIndex = -1;
+  title.textContent = "Qual arquivo você quis dizer?";
+  const explanation = document.createElement("p");
+  explanation.textContent = selection.interpretation || `Encontrei ${selection.total} candidatos relacionados a “${selection.query}”.`;
+  const hint = document.createElement("p"); hint.className = "selection-hint";
+  hint.textContent = "Datas no nome e de modificação são pistas diferentes. Escolha o arquivo para continuar.";
+  const list = document.createElement("div"); list.className = "selection-list";
+  list.setAttribute("role", "group"); list.setAttribute("aria-label", "Arquivos candidatos");
+  selection.candidates.forEach((candidate, index) => {
+    const button = document.createElement("button"); button.type = "button";
+    button.className = "selection-option";
+    const name = document.createElement("strong"); name.textContent = candidate.path;
+    const details = document.createElement("small");
+    details.textContent = `${candidate.extension} · Alterado: ${candidate.modified}`
+      + (candidate.name_date ? ` · Data no nome: ${candidate.name_date}` : "")
+      + ` · ${candidate.reason}`;
+    button.append(name, details);
+    button.addEventListener("click", () => selectFileCandidate(index));
+    list.append(button);
+  });
+  if (selection.total > selection.candidates.length) {
+    const more = document.createElement("p"); more.className = "selection-hint";
+    more.textContent = `Mostrando ${selection.candidates.length} de ${selection.total}. Refine o pedido se o arquivo não aparecer.`;
+    list.append(more);
+  }
+  const cancel = document.createElement("button"); cancel.type = "button";
+  cancel.className = "approval-deny selection-cancel"; cancel.textContent = "Cancelar";
+  cancel.addEventListener("click", () => selectFileCandidate(null));
+  card.append(eyebrow, title, explanation, hint, list, cancel);
+  messages.append(card); scrollChat(); title.focus(); setBusy(false);
+}
+async function selectFileCandidate(index) {
+  if (busy || !pendingSelection || !currentId) return;
+  const selection = pendingSelection;
+  setBusy(true);
+  try {
+    const data = await api("/api/files/select", {conversation_id: currentId,
+      selection_id: selection.id, index});
+    pendingSelection = null;
+    if (data.cancelled) { renderConversation(); return; }
+    Array.from(messages.children).find(node => node.className?.includes("selection-card"))?.remove();
+    approvalCard(data.proposal);
+  } catch (error) {
+    pendingSelection = null; renderConversation(); toast(error.message);
+  } finally { setBusy(false); renderRecent(); }
+}
 async function decideFileAction(confirm) {
   if (busy || !pendingProposal || !currentId) return;
   const proposal = pendingProposal;
@@ -174,7 +228,7 @@ async function decideFileAction(confirm) {
   try {
     const data = await api("/api/files/decide", {conversation_id: currentId,
       proposal_id: proposal.id, confirm});
-    pendingProposal = null;
+    pendingProposal = null; pendingSelection = null;
     activeConversation = data.conversation;
     renderConversation();
     await refreshRecent();
@@ -442,9 +496,10 @@ async function openConversation(id) {
     currentId = data.id; activeConversation = data;
     selectedModel = data.model || "auto"; updateModelLabel();
     editing = false; renderConversation();
-    pendingProposal = null;
+    pendingProposal = null; pendingSelection = null;
     const pending = await api(`/api/files/pending?conversation_id=${encodeURIComponent(id)}`);
     if (pending.proposal) approvalCard(pending.proposal, pending.proposal.request);
+    else if (pending.selection) selectionCard(pending.selection, pending.selection.request);
     $("chatTitle").textContent = data.title;
     promptInput.value = ""; resizeInput();
     if (window.matchMedia("(max-width: 760px)").matches) sidebar(false);
@@ -454,7 +509,7 @@ async function openConversation(id) {
 }
 function newChat() {
   if (busy) return;
-  currentId = null; activeConversation = null; editing = false; pendingProposal = null;
+  currentId = null; activeConversation = null; editing = false; pendingProposal = null; pendingSelection = null;
   selectedModel = "auto"; updateModelLabel(); closeModelMenu();
   messages.replaceChildren(); showWelcome(true);
   $("chatTitle").textContent = "Nova conversa"; promptInput.value = ""; resizeInput();
@@ -464,7 +519,7 @@ function newChat() {
 }
 function resizeInput() { promptInput.style.height = "auto"; promptInput.style.height = `${Math.min(170, promptInput.scrollHeight)}px`; }
 $("chatForm").addEventListener("submit", async (event) => {
-  event.preventDefault(); if (busy || pendingProposal) return;
+  event.preventDefault(); if (busy || pendingProposal || pendingSelection) return;
   const text = promptInput.value.trim(); if (!text) return;
   const area = $("chatArea");
   const distance = area.scrollHeight - area.scrollTop - area.clientHeight;
@@ -501,7 +556,10 @@ $("chatForm").addEventListener("submit", async (event) => {
     }
     const data = await api("/api/files/prepare", {message: text, conversation_id: currentId});
     pending.remove();
-    if (data.proposal) {
+    if (data.selection) {
+      userMessage.remove();
+      selectionCard(data.selection, text);
+    } else if (data.proposal) {
       userMessage.remove();
       approvalCard(data.proposal, text);
     } else if (data.clarification) {

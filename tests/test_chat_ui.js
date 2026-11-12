@@ -44,10 +44,21 @@ const context={console,document,TextDecoder,setTimeout:()=>0,clearTimeout:()=>{}
     }
     if(path==='/api/model'){conversation.model=body.model;return {ok:true,json:async()=>({model:body.model})};}
     if(path==='/api/files/prepare'){
+      if(body.message.includes('currículo'))return {ok:true,json:async()=>({selection:{
+        id:'choice-one',interpretation:'Encontrar o currículo mais atual',request:body.message,
+        query:'currículo',total:2,candidates:[
+          {path:'CV_2026.pdf',extension:'.pdf',modified:'2026-01-01T10:00',
+           name_date:'2026-01-01',reason:'nome relacionado a currículo'},
+          {path:'Currículo_2024.docx',extension:'.docx',modified:'2025-01-01T10:00',
+           name_date:'2024-01-01',reason:'nome relacionado a currículo'}]
+      }})};
       return {ok:true,json:async()=>({proposal:{id:'proposal-one',interpretation:'Criar uma nota de teste',
         operation:'create',source:'nota.md',target:null,root:'Documentos',preview:'create: nota.md',
         request:body.message}})};
     }
+    if(path==='/api/files/select')return {ok:true,json:async()=>({proposal:{
+      id:'proposal-two',interpretation:'Ler o currículo escolhido',operation:'read',
+      source:'CV_2026.pdf',target:null,root:'Documentos',preview:'read: CV_2026.pdf'}})};
     if(path==='/api/files/decide'){
       conversation.messages.push({role:'user',content:'Crie uma nota'},
         {role:'assistant',content:body.confirm?'Ação concluída':'Ação negada'});
@@ -215,6 +226,15 @@ async function main(){
   await card.children.at(-1).children[1].events.click();
   assert.equal(requests.filter(r=>r.path==='/api/files/decide').length,1);
   assert.match(el('messages').textContent,/Ação concluída/);
+  el('prompt').value='Ache o currículo mais atual';
+  await el('chatForm').events.submit({preventDefault(){}});
+  const selectionCard=el('messages').children.at(-1);
+  assert.match(selectionCard.className,/selection-card/);
+  assert.match(selectionCard.textContent,/CV_2026.pdf/);
+  assert.equal(requests.filter(r=>r.path==='/api/files/select').length,0);
+  await selectionCard.children[4].children[0].events.click();
+  assert.equal(requests.filter(r=>r.path==='/api/files/select').length,1);
+  assert.equal(el('messages').children.at(-1).className,'approval-card');
   console.log('Chat UI: flows, recent search, safe Markdown, errors, lab and mobile menu passed.');
 }
 main().catch(error=>{console.error(error);process.exitCode=1;});

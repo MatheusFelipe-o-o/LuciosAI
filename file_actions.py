@@ -5,10 +5,14 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
+import re
+import unicodedata
+from datetime import datetime
 
 MAX_TEXT = 256_000
 MAX_EDIT = 12_000
 TEXT_TYPES = {".txt", ".md", ".py", ".js", ".css", ".html", ".json", ".csv", ".yaml", ".yml"}
+DOCUMENT_TYPES = {".pdf", ".doc", ".docx", ".odt", ".rtf", ".txt", ".md", ".pages"}
 OPERATIONS = {"list", "search", "read", "mkdir", "create", "edit", "copy", "move", "rename", "delete"}
 
 
@@ -69,6 +73,66 @@ class FileActions:
         if not path.is_file() or path.suffix.lower() not in TEXT_TYPES or path.stat().st_size > MAX_EDIT:
             raise FileActionError("A edição exige um arquivo de texto existente de até 12 KB.")
         return path.read_text(encoding="utf-8")
+
+    def fingerprint(self, name):
+        path = _path(self.root, name)
+        return str(path), _signature(path)
+
+    def find_candidates(self, folder, query):
+        """Localiza nomes aproximados sem abrir o conteúdo dos arquivos."""
+        directory = _path(self.root, folder)
+        if not directory.is_dir() or not isinstance(query, str) or not query.strip():
+            raise FileActionError("Informe uma pasta e um nome para a busca.")
+        def normalize(value):
+            value = unicodedata.normalize("NFKD", value.casefold())
+            return "".join(ch for ch in value if not unicodedata.combining(ch))
+        needle = normalize(query).strip()
+        aliases = {"curriculo", "curriculum", "cv", "resume", "resumee"}
+        terms = aliases if needle in aliases else {needle}
+        def files():
+            for parent, folders, names in os.walk(directory, followlinks=False):
+                folders[:] = [name for name in folders
+                              if name not in {"node_modules", ".git", ".venv", "venv",
+                                              "__pycache__", ".lucios_trash"}
+                              and not (Path(parent) / name).is_symlink()]
+                for name in names:
+                    yield Path(parent) / name
+        matches = []
+        for path in files():
+            if not path.is_file() or path.is_symlink() or not _inside(self.root, path.resolve()):
+                continue
+            stem = normalize(path.stem)
+            words = set(re.findall(r"[a-z0-9]+", stem))
+            matched = [term for term in terms if (term in words if len(term) <= 2 else term in stem)]
+            if not matched:
+                continue
+            if set(matched) <= {"cv", "resume"} and path.suffix.lower() not in DOCUMENT_TYPES:
+                continue
+            info = path.stat()
+            date = None
+            iso = re.search(r"(20\d{2})[-_. ]?(0[1-9]|1[0-2])[-_. ]?([0-2]\d|3[01])", stem)
+            br = re.search(r"([0-2]\d|3[01])[-_. ]?(0[1-9]|1[0-2])[-_. ]?(20\d{2})", stem)
+            try:
+                if iso:
+                    date = datetime(int(iso[1]), int(iso[2]), int(iso[3])).date().isoformat()
+                elif br:
+                    date = datetime(int(br[3]), int(br[2]), int(br[1])).date().isoformat()
+                else:
+                    year = re.search(r"20\d{2}", stem)
+                    if year:
+                        date = f"{year[0]}-01-01"
+            except ValueError:
+                pass
+            matches.append({
+                "path": str(path.relative_to(self.root)),
+                "extension": path.suffix.lower() or "sem extensão",
+                "modified": datetime.fromtimestamp(info.st_mtime).isoformat(timespec="minutes"),
+                "name_date": date,
+                "reason": f"nome contém “{matched[0]}” relacionado a {query}",
+            })
+        matches.sort(key=lambda item: (item["extension"] in DOCUMENT_TYPES,
+                                       item["name_date"] or "", item["modified"]), reverse=True)
+        return matches
 
     def prepare(self, data):
         operation = data.get("operation")
@@ -144,9 +208,7 @@ class FileActions:
             names = sorted(p.name + ("/" if p.is_dir() else "") for p in source.iterdir())
             return "\n".join(names[:100]) or "Pasta vazia."
         if op == "search":
-            names = sorted(str(p.relative_to(self.root)) for p in source.rglob("*")
-                           if p.is_file() and not p.is_symlink() and _inside(self.root, p.resolve())
-                           and proposal.query in p.name.casefold())
+            names = [item["path"] for item in self.find_candidates(proposal.source, proposal.query)]
             if not names:
                 return "Nenhum arquivo encontrado."
             listing = "\n".join(names[:100])

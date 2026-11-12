@@ -52,6 +52,18 @@ class FileActionTests(unittest.TestCase):
         self.actions.execute(self.plan("copy", "nota.md", target="copia.md"))
         self.assertEqual((self.root / "copia.md").read_text(encoding="utf-8"), "Olá")
 
+    def test_curriculo_encontra_acentos_cv_e_datas(self):
+        for name in ("Currículo_2024.pdf", "CV_Matheus_2025.docx",
+                     "curriculum-2026-01-15.txt", "foto.png"):
+            (self.root / name).write_bytes(b"x")
+        result = self.actions.execute(self.plan("search", ".", query="curriculo"))
+        self.assertIn("3 arquivo(s)", result)
+        self.assertIn("CV_Matheus_2025.docx", result)
+        candidates = self.actions.find_candidates(".", "currículo")
+        self.assertEqual(len(candidates), 3)
+        self.assertEqual(candidates[0]["path"], "curriculum-2026-01-15.txt")
+        self.assertEqual(candidates[0]["name_date"], "2026-01-15")
+
     def test_caminho_fora_da_raiz_e_sobrescrita_recusados(self):
         with self.assertRaises(FileActionError):
             self.plan("read", "../fora.txt")
