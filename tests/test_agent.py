@@ -41,6 +41,22 @@ class ConciliacaoTests(unittest.TestCase):
         self.assertEqual(parts, ["parcial"])
         self.assertEqual(self.agent.conversa, [])
 
+    @patch("Agent.resolve_thinking", return_value=True)
+    @patch("Agent.ollama.chat")
+    def test_esforco_envia_think_e_separa_raciocinio_da_resposta(self, chat, resolve):
+        chat.return_value = iter([
+            {"message": {"thinking": "passo interno", "content": ""}, "done": False},
+            {"message": {"thinking": "", "content": "Resposta"}, "done": False},
+            {"message": {"content": " final"}, "done": True},
+        ])
+        parts, states = [], []
+        answer = self.agent.chat("Oi", on_chunk=parts.append, on_state=states.append, effort="high")
+        self.assertEqual(answer, "Resposta final")
+        self.assertEqual(parts, ["Resposta", " final"])
+        self.assertEqual(states, ["thinking", "answer"])
+        self.assertNotIn("passo interno", self.agent.conversa[-1]["content"])
+        self.assertIs(chat.call_args.kwargs["think"], True)
+
     @patch("Agent.ollama.chat")
     def test_conversa_comum_faz_uma_chamada_sem_ler_memoria(self, chat):
         chat.return_value = {"message": {"content": "**Olá!**"}}

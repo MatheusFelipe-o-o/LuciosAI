@@ -27,6 +27,7 @@ class Element {
 for(const match of html.matchAll(/id="([^"]+)"/g))elements.set(match[1],new Element());
 const el=id=>elements.get(id);
 el('modelMenu').hidden=true;
+el('effortMenu').hidden=true;
 const requests=[];
 let entries=[],failChat=false,mobile=false,opened=0,lastTarget,confirmDelete=false,failDelete=false,confirmation='';
 let conversation=null, answerNumber=0;
@@ -37,12 +38,24 @@ const context={console,document,TextDecoder,setTimeout:()=>0,clearTimeout:()=>{}
     const body=options?.body?JSON.parse(options.body):{};
     if(path==='/api/conversations')return {ok:true,json:async()=>({conversations:entries,model:'local-test'})};
     if(path==='/api/models')return {ok:true,json:async()=>({models:['small:latest','large:latest'],available:true})};
+    if(path.startsWith('/api/thinking?')){
+      const model=decodeURIComponent(path.split('model=')[1]);
+      const available=model==='large:latest'
+        ? {light:true,medium:true,high:true,extra_high:false}
+        : model==='small:latest'
+          ? {light:true,medium:false,high:true,extra_high:false}
+          : {light:false,medium:false,high:false,extra_high:false};
+      return {ok:true,json:async()=>({backend:'Ollama',model,available,
+        mode:model==='large:latest'?'named':model==='small:latest'?'toggle':'none'})};
+    }
     if(path==='/api/new'){
       const item={id:'a'.repeat(32),title:'Nova conversa',updated:new Date().toISOString()};
-      entries=[item];conversation={...item,model:body.model||'auto',messages:[],editable:false,editable_turn:null};
+      entries=[item];conversation={...item,model:body.model||'auto',effort:body.effort||'auto',
+        messages:[],editable:false,editable_turn:null};
       return {ok:true,json:async()=>item};
     }
-    if(path==='/api/model'){conversation.model=body.model;return {ok:true,json:async()=>({model:body.model})};}
+    if(path==='/api/model'){conversation.model=body.model;conversation.effort='auto';return {ok:true,json:async()=>({model:body.model,effort:'auto'})};}
+    if(path==='/api/effort'){conversation.effort=body.effort;return {ok:true,json:async()=>({effort:body.effort})};}
     if(path==='/api/files/prepare'){
       if(body.message.includes('currículo'))return {ok:true,json:async()=>({selection:{
         id:'choice-one',interpretation:'Encontrar o currículo mais atual',request:body.message,
@@ -144,6 +157,12 @@ async function main(){
   assert.equal(el('modelOptions').children.length,3);
   await el('modelOptions').children[2].events.click();
   assert.equal(el('modelName').textContent,'large:latest');
+  await settle();
+  await el('effortBtn').events.click();
+  assert.equal(el('effortOptions').children.length,4);
+  assert.equal(el('effortOptions').children[3].disabled,true);
+  await el('effortOptions').children[2].events.click();
+  assert.equal(el('effortName').textContent,'High');
   el('prompt').value='<script>alert(1)</script>';
   await el('chatForm').events.submit({preventDefault(){}});
   assert.equal(el('messages').children.length,2);
@@ -154,6 +173,7 @@ async function main(){
   assert.equal(request.options.headers['X-Lucios-Token'],'secret-token');
   assert.equal(JSON.parse(request.options.body).conversation_id,'a'.repeat(32));
   assert.equal(JSON.parse(requests.find(r=>r.path==='/api/new').options.body).model,'large:latest');
+  assert.equal(JSON.parse(requests.find(r=>r.path==='/api/new').options.body).effort,'high');
   assert.equal(el('messages').children[1].children[1].children[0].children[1].tagName,'strong');
   el('search').value='inexistente';el('search').events.input();
   assert.match(el('recentList').textContent,/Nenhuma conversa/);

@@ -82,7 +82,7 @@ class WebTests(unittest.TestCase):
         self.assertEqual(response.status, 200)
         self.assertIn("application/x-ndjson", response.getheader("Content-Type"))
         events = [json.loads(line) for line in response.read().decode("utf-8").splitlines()]
-        self.assertEqual([event["type"] for event in events], ["delta", "delta", "done"])
+        self.assertEqual([event["type"] for event in events], ["state", "delta", "delta", "done"])
         self.assertEqual("".join(event["text"] for event in events if event["type"] == "delta"),
                          "Olá mundo")
         self.assertEqual(len(self.servidor.store.get(identifier)["messages"]), 2)
@@ -99,8 +99,8 @@ class WebTests(unittest.TestCase):
                      json.dumps({"message": "Oi", "conversation_id": identifier}),
                      {"Content-Type": "application/json", "X-Lucios-Token": self.servidor.token})
         events = [json.loads(line) for line in conn.getresponse().read().decode("utf-8").splitlines()]
-        self.assertEqual([event["type"] for event in events], ["delta", "error"])
-        self.assertEqual(events[0]["text"], "parcial")
+        self.assertEqual([event["type"] for event in events], ["state", "delta", "error"])
+        self.assertEqual(events[1]["text"], "parcial")
         self.assertEqual(self.servidor.store.get(identifier)["messages"], [])
 
     def test_repetir_resposta_por_stream_mantem_versoes(self):
@@ -116,7 +116,7 @@ class WebTests(unittest.TestCase):
                      json.dumps({"action": "retry", "turn": 0, "conversation_id": identifier}),
                      {"Content-Type": "application/json", "X-Lucios-Token": self.servidor.token})
         events = [json.loads(line) for line in conn.getresponse().read().decode("utf-8").splitlines()]
-        self.assertEqual([e["type"] for e in events], ["delta", "delta", "done"])
+        self.assertEqual([e["type"] for e in events], ["state", "delta", "delta", "done"])
         saved = self.servidor.store.get(identifier)["messages"][-1]
         self.assertEqual(len(saved["alternatives"]), 2)
         self.assertEqual(saved["content"], "Nova versão")
@@ -234,6 +234,25 @@ class WebTests(unittest.TestCase):
             self.assertEqual(self.post("/api/model", {"conversation_id": identifier,
                                                         "model": "inventado:latest"})[0], 400)
             self.assertEqual(self.servidor.store.get(identifier)["model"], "small:latest")
+
+    def test_esforco_disponivel_e_persistido_por_conversa(self):
+        capabilities = {"backend": "Ollama", "model": "qwen3:8b",
+                        "available": {"light": True, "medium": False,
+                                      "high": True, "extra_high": False},
+                        "mode": "toggle"}
+        with patch.object(web_app, "validar_modelo", return_value="qwen3:8b"), \
+             patch.object(web_app, "describe_thinking", return_value=capabilities), \
+             patch.object(web_app, "resolve_thinking", return_value=True):
+            status, body = self.get("/api/thinking?model=qwen3%3A8b")
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body)["available"]["medium"], False)
+            identifier = self.post("/api/new", {"model": "qwen3:8b"})[1]["id"]
+            self.assertEqual(self.post("/api/effort", {
+                "conversation_id": identifier, "effort": "high"})[0], 200)
+            self.assertEqual(self.servidor.store.get(identifier)["effort"], "high")
+            self.assertEqual(json.loads(self.get("/api/conversation?id=" + identifier)[1])["effort"], "high")
+            self.post("/api/model", {"conversation_id": identifier, "model": "llama3.2"})
+            self.assertEqual(self.servidor.store.get(identifier)["effort"], "auto")
 
     def test_nova_resposta_navegacao_e_bloqueio_apos_proximo_prompt(self):
         identifier = self.post("/api/new")[1]["id"]

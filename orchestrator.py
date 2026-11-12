@@ -208,20 +208,30 @@ class ContextoExecucao:
             self.verificar_limites()
         return resposta
 
-    def chamar_modelo_stream(self, on_chunk, etapa="inferencia", **parametros):
+    def chamar_modelo_stream(self, on_chunk, on_state=None, etapa="inferencia", **parametros):
         """Consome o iterador dentro da medição e entrega fragmentos reais do Ollama."""
         self.verificar_limites()
         if self.resultado.chamadas_modelo >= self.config.limite_chamadas:
             raise RuntimeError("Limite de chamadas ao modelo atingido.")
         self.resultado.chamadas_modelo += 1
         partes = []
+        state = None
         with self.medir(etapa) as medicao:
             _notificar({"fase": "modelo", "etapa": "/".join(_caminho_medicoes.get()),
                         "modelo": parametros.get("model")})
             for chunk in self._chamar_modelo(stream=True, **parametros):
                 self.verificar_limites()
+                if _campo(_campo(chunk, "message", {}), "thinking", ""):
+                    if state != "thinking":
+                        state = "thinking"
+                        if on_state:
+                            on_state(state)
                 fragmento = _campo(_campo(chunk, "message", {}), "content", "") or ""
                 if fragmento:
+                    if state != "answer":
+                        state = "answer"
+                        if on_state:
+                            on_state(state)
                     partes.append(fragmento)
                     on_chunk(fragmento)
                 if _campo(chunk, "done", False):

@@ -16,10 +16,13 @@ class ConversationStore:
             db.execute("""CREATE TABLE IF NOT EXISTS conversations (
                 id TEXT PRIMARY KEY, title TEXT NOT NULL, messages TEXT NOT NULL,
                 context TEXT NOT NULL, updated TEXT NOT NULL,
-                model TEXT NOT NULL DEFAULT 'auto')""")
+                model TEXT NOT NULL DEFAULT 'auto',
+                effort TEXT NOT NULL DEFAULT 'auto')""")
             columns = {row["name"] for row in db.execute("PRAGMA table_info(conversations)")}
             if "model" not in columns:
                 db.execute("ALTER TABLE conversations ADD COLUMN model TEXT NOT NULL DEFAULT 'auto'")
+            if "effort" not in columns:
+                db.execute("ALTER TABLE conversations ADD COLUMN effort TEXT NOT NULL DEFAULT 'auto'")
 
     @contextmanager
     def connect(self):
@@ -31,14 +34,14 @@ class ConversationStore:
         finally:
             db.close()
 
-    def create(self, model="auto"):
+    def create(self, model="auto", effort="auto"):
         identifier = uuid4().hex
         now = datetime.now(timezone.utc).isoformat()
         with self.connect() as db:
             db.execute("""INSERT INTO conversations
-                       (id, title, messages, context, updated, model)
-                       VALUES (?, ?, ?, ?, ?, ?)""",
-                       (identifier, "Nova conversa", "[]", "[]", now, model))
+                       (id, title, messages, context, updated, model, effort)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                       (identifier, "Nova conversa", "[]", "[]", now, model, effort))
         return self.get(identifier)
 
     def get(self, identifier):
@@ -66,8 +69,15 @@ class ConversationStore:
 
     def set_model(self, identifier, model):
         with self.connect() as db:
-            changed = db.execute("UPDATE conversations SET model = ? WHERE id = ?",
+            changed = db.execute("UPDATE conversations SET model = ?, effort = 'auto' WHERE id = ?",
                                  (model, identifier))
+            if changed.rowcount != 1:
+                raise ValueError("Conversa não encontrada.")
+
+    def set_effort(self, identifier, effort):
+        with self.connect() as db:
+            changed = db.execute("UPDATE conversations SET effort = ? WHERE id = ?",
+                                 (effort, identifier))
             if changed.rowcount != 1:
                 raise ValueError("Conversa não encontrada.")
 

@@ -3,6 +3,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+from queue import Queue, Full
 import secrets
 import threading
 import time
@@ -14,6 +15,7 @@ from Agent import LuciosAgent
 from conversations import ConversationStore
 from file_actions import FileActions, FileActionError
 from orchestrator import Estado
+from thinking import describe as describe_thinking, resolve as resolve_thinking, ThinkingUnavailable
 
 HOST = "127.0.0.1"
 PORT = 8000
@@ -21,6 +23,43 @@ ROOT = Path(__file__).resolve().parent
 agent = LuciosAgent()
 agent_lock = threading.Lock()
 FILES_ROOT = Path(os.getenv("LUCIOS_FILES_ROOT", str(Path.home() / "Documents")))
+
+
+class StreamEvents:
+    """Um escritor por resposta; a inferência apenas enfileira eventos reais."""
+    def __init__(self, handler):
+        self.handler = handler
+        self.events = Queue(maxsize=128)
+        self.error = None
+        self.worker = threading.Thread(target=self._write, daemon=True)
+        self.worker.start()
+
+    def _write(self):
+        while True:
+            event = self.events.get()
+            if event is None:
+                return
+            if self.error is not None:
+                continue
+            try:
+                self.handler.wfile.write((json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8"))
+                self.handler.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError) as error:
+                self.error = error
+
+    def emit(self, event):
+        while True:
+            if self.error is not None:
+                raise BrokenPipeError("Cliente desconectado.") from self.error
+            try:
+                self.events.put(event, timeout=0.1)
+                return
+            except Full:
+                continue
+
+    def close(self):
+        self.events.put(None)
+        self.worker.join(timeout=5)
 
 
 def interpretar_acao(message, model, history=None, root=None):
@@ -108,18 +147,19 @@ def validar_modelo(model):
     return model
 
 
-def resposta_com_modelo(message, model):
+def resposta_com_modelo(message, model, effort="auto"):
     if model == "auto":
-        return agent.chat(message)
+        return agent.chat(message, effort=effort)
     validar_modelo(model)
-    return agent.chat(message, modelo_resposta=model)
+    return agent.chat(message, modelo_resposta=model, effort=effort)
 
 
-def resposta_stream(message, model, on_chunk):
+def resposta_stream(message, model, on_chunk, effort="auto", on_state=None):
     if model == "auto":
-        return agent.chat(message, on_chunk=on_chunk)
+        return agent.chat(message, on_chunk=on_chunk, on_state=on_state, effort=effort)
     validar_modelo(model)
-    return agent.chat(message, modelo_resposta=model, on_chunk=on_chunk)
+    return agent.chat(message, modelo_resposta=model, on_chunk=on_chunk,
+                      on_state=on_state, effort=effort)
 
 
 def turno_editavel(item):
@@ -216,6 +256,14 @@ class LuciosWebHandler(BaseHTTPRequestHandler):
             except Exception:
                 self.send_json({"models": [], "available": False})
             return
+        if url.path == "/api/thinking":
+            model = parse_qs(url.query).get("model", ["auto"])[0]
+            try:
+                actual = agent.model_name if model == "auto" else validar_modelo(model)
+                self.send_json(describe_thinking(actual))
+            except (ThinkingUnavailable, ValueError, OSError) as error:
+                self.send_json({"error": str(error)}, 503)
+            return
         if url.path == "/api/conversation":
             try:
                 item = self.server.store.get(parse_qs(url.query).get("id", [None])[0])
@@ -254,14 +302,32 @@ class LuciosWebHandler(BaseHTTPRequestHandler):
             return
         try:
             if self.path == "/api/new":
-                self.send_json(publico(self.server.store.create(
-                    validar_modelo(payload.get("model", "auto")))))
+                model = validar_modelo(payload.get("model", "auto"))
+                effort = payload.get("effort", "auto")
+                actual = agent.model_name if model == "auto" else model
+                try:
+                    resolve_thinking(actual, effort)
+                except ThinkingUnavailable as error:
+                    raise ChatActionError(str(error)) from error
+                self.send_json(publico(self.server.store.create(model, effort)))
                 return
             if self.path == "/api/model":
                 model = validar_modelo(payload.get("model"))
                 with agent_lock:
                     self.server.store.set_model(payload.get("conversation_id"), model)
-                self.send_json({"model": model})
+                self.send_json({"model": model, "effort": "auto"})
+                return
+            if self.path == "/api/effort":
+                level = payload.get("effort")
+                with agent_lock:
+                    item = self.server.store.get(payload.get("conversation_id"))
+                    actual = agent.model_name if item["model"] == "auto" else item["model"]
+                    try:
+                        resolve_thinking(actual, level)
+                    except ThinkingUnavailable as error:
+                        raise ChatActionError(str(error), 400) from error
+                    self.server.store.set_effort(item["id"], level)
+                self.send_json({"effort": level})
                 return
             if self.path == "/api/delete":
                 identifier = payload.get("conversation_id")
@@ -322,7 +388,8 @@ class LuciosWebHandler(BaseHTTPRequestHandler):
                     success = agent.estado_encerramento != "falhou"
                     status = 200 if success else 502
                 else:
-                    reply = (resposta_com_modelo(message, conversation["model"])
+                    reply = (resposta_com_modelo(message, conversation["model"],
+                                                conversation["effort"])
                              if self.path == "/api/chat" and conversation is not None
                              else agent.chat(message if self.path == "/api/chat" else "limpar"))
                     state = agent.ultimo_resultado.estado
@@ -462,12 +529,14 @@ class LuciosWebHandler(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.end_headers()
             self.close_connection = True
-            def send_event(event):
-                self.wfile.write((json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8"))
-                self.wfile.flush()
+            events = StreamEvents(self)
+            send_event = events.emit
             try:
-                reply = resposta_stream(message, conversation["model"],
-                                        lambda part: send_event({"type": "delta", "text": part}))
+                reply = resposta_stream(
+                    message, conversation["model"],
+                    lambda part: send_event({"type": "delta", "text": part}),
+                    conversation["effort"],
+                    lambda state: send_event({"type": "state", "state": state}))
                 state = agent.ultimo_resultado.estado
                 if state != Estado.CONCLUIDO:
                     send_event({"type": "error", "message": reply})
@@ -487,6 +556,8 @@ class LuciosWebHandler(BaseHTTPRequestHandler):
                     send_event({"type": "error", "message": "A geração foi interrompida. Tente novamente."})
                 except (BrokenPipeError, ConnectionResetError):
                     pass
+            finally:
+                events.close()
 
     def stream_turn(self, payload):
         action = payload.get("action")
@@ -512,12 +583,12 @@ class LuciosWebHandler(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.end_headers()
             self.close_connection = True
-            def send_event(event):
-                self.wfile.write((json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8"))
-                self.wfile.flush()
+            events = StreamEvents(self)
+            send_event = events.emit
             try:
-                reply = resposta_stream(text, item["model"],
-                                        lambda part: send_event({"type": "delta", "text": part}))
+                reply = resposta_stream(
+                    text, item["model"], lambda part: send_event({"type": "delta", "text": part}),
+                    item["effort"], lambda state: send_event({"type": "state", "state": state}))
                 state = agent.ultimo_resultado.estado
                 if state != Estado.CONCLUIDO:
                     agent.conversa = item["context"]
@@ -544,6 +615,8 @@ class LuciosWebHandler(BaseHTTPRequestHandler):
                     send_event({"type": "error", "message": "A geração foi interrompida. Tente novamente."})
                 except (BrokenPipeError, ConnectionResetError):
                     pass
+            finally:
+                events.close()
 
     def decide_file_action(self, payload):
         identifier, proposal_id, confirm = (payload.get("conversation_id"),

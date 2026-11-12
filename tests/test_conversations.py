@@ -21,6 +21,7 @@ class ConversationTests(unittest.TestCase):
                 db.close()
             store = ConversationStore(path)
             self.assertEqual(store.get("a" * 32)["model"], "auto")
+            self.assertEqual(store.get("a" * 32)["effort"], "auto")
             self.assertEqual(store.get("a" * 32)["messages"][0]["content"], "Oi")
 
     def test_exclusao_persiste_e_preserva_outros(self):
@@ -47,3 +48,14 @@ class ConversationTests(unittest.TestCase):
             self.assertEqual(reopened.list()[0]["title"], "Título com acentuação")
             with self.assertRaises(ValueError):
                 reopened.get("' OR 1=1 --")
+
+    def test_esforco_persiste_e_mudar_modelo_redefine_para_padrao(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "history.db"
+            store = ConversationStore(path)
+            item = store.create("qwen3:8b", "light")
+            self.assertEqual(ConversationStore(path).get(item["id"])["effort"], "light")
+            store.set_effort(item["id"], "high")
+            self.assertEqual(ConversationStore(path).get(item["id"])["effort"], "high")
+            store.set_model(item["id"], "llama3.2")
+            self.assertEqual(ConversationStore(path).get(item["id"])["effort"], "auto")
