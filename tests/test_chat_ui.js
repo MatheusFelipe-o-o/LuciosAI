@@ -31,7 +31,7 @@ const requests=[];
 let entries=[],failChat=false,mobile=false,opened=0,lastTarget,confirmDelete=false,failDelete=false,confirmation='';
 let conversation=null, answerNumber=0;
 const document={body:new Element(),getElementById:el,querySelector:()=>({content:'secret-token'}),querySelectorAll:()=>[],createElementNS:(_,tag)=>new Element(tag),createElement:tag=>new Element(tag),createTextNode:text=>{const e=new Element('#text');e.textContent=text;return e;},addEventListener:()=>{}};
-const context={console,document,setTimeout:()=>0,clearTimeout:()=>{},window:{confirm:text=>{confirmation=text;return confirmDelete;},matchMedia:()=>({matches:mobile,addEventListener:()=>{}}),open:()=>{opened++;lastTarget={location:{replace:url=>{lastTarget.url=url;}},close:()=>{}};return lastTarget;}},
+const context={console,document,TextDecoder,setTimeout:()=>0,clearTimeout:()=>{},window:{confirm:text=>{confirmation=text;return confirmDelete;},matchMedia:()=>({matches:mobile,addEventListener:()=>{}}),open:()=>{opened++;lastTarget={location:{replace:url=>{lastTarget.url=url;}},close:()=>{}};return lastTarget;}},
   fetch:async(path,options)=>{
     requests.push({path,options});
     const body=options?.body?JSON.parse(options.body):{};
@@ -53,7 +53,7 @@ const context={console,document,setTimeout:()=>0,clearTimeout:()=>{},window:{con
         {role:'assistant',content:body.confirm?'Ação concluída':'Ação negada'});
       return {ok:true,json:async()=>({result:'Ação concluída',conversation})};
     }
-    if(path==='/api/chat'){
+    if(path==='/api/chat-stream'){
       if(failChat)return {ok:false,json:async()=>({error:'Modelo indisponível'})};
       const reply='**Resposta**\n\n- Item';
       if(!conversation.messages.length)entries[0].title=body.message;
@@ -61,7 +61,13 @@ const context={console,document,setTimeout:()=>0,clearTimeout:()=>{},window:{con
       conversation.messages.push({role:'user',content:body.message},
         {role:'assistant',content:reply,alternatives:[{content:reply,model:conversation.model}],selected:0});
       conversation.editable=true;conversation.editable_turn=conversation.messages.length-2;
-      return {ok:true,json:async()=>({reply,conversation})};
+      const lines=[{type:'delta',text:'**Res'},{type:'delta',text:'posta**\n\n- Item'},
+        {type:'done',conversation}].map(x=>JSON.stringify(x)+'\n');
+      let next=0;
+      return {ok:true,body:{getReader:()=>({
+        read:async()=>next<lines.length?{done:false,value:Buffer.from(lines[next++])}:{done:true},
+        releaseLock:()=>{}
+      })}};
     }
     if(path.startsWith('/api/conversation?'))return {ok:true,json:async()=>conversation};
     if(path==='/api/retry'){
@@ -70,6 +76,29 @@ const context={console,document,setTimeout:()=>0,clearTimeout:()=>{},window:{con
       answer.alternatives.push({content:text,model:conversation.model});
       answer.selected=answer.alternatives.length-1;answer.content=text;
       return {ok:true,json:async()=>({conversation})};
+    }
+    if(path==='/api/turn-stream'){
+      let text;
+      if(body.action==='edit'){
+        conversation.messages.at(-2).content=body.message;
+        text='Resposta revisada';
+        conversation.messages.at(-1).alternatives=[{content:text,model:conversation.model}];
+        conversation.messages.at(-1).selected=0;
+        conversation.title=body.message;entries[0].title=body.message;
+      }else{
+        answerNumber++;text='Alternativa '+answerNumber;
+        const answer=conversation.messages.at(-1);
+        answer.alternatives.push({content:text,model:conversation.model});
+        answer.selected=answer.alternatives.length-1;
+      }
+      conversation.messages.at(-1).content=text;
+      const lines=[{type:'delta',text:text.slice(0,4)},{type:'delta',text:text.slice(4)},
+        {type:'done',conversation}].map(x=>JSON.stringify(x)+'\n');
+      let next=0;
+      return {ok:true,body:{getReader:()=>({
+        read:async()=>next<lines.length?{done:false,value:Buffer.from(lines[next++])}:{done:true},
+        releaseLock:()=>{}
+      })}};
     }
     if(path==='/api/select-answer'){
       const answer=conversation.messages.at(-1);answer.selected=body.index;
@@ -110,7 +139,7 @@ async function main(){
   assert.equal(el('welcome').hidden,true);
   assert.equal(el('chatTitle').textContent,'<script>alert(1)</script>',el('toast').textContent);
   assert.equal(el('messages').children[0].children[1].textContent,'<script>alert(1)</script>');
-  const request=requests.find(r=>r.path==='/api/chat');
+  const request=requests.find(r=>r.path==='/api/chat-stream');
   assert.equal(request.options.headers['X-Lucios-Token'],'secret-token');
   assert.equal(JSON.parse(request.options.body).conversation_id,'a'.repeat(32));
   assert.equal(JSON.parse(requests.find(r=>r.path==='/api/new').options.body).model,'large:latest');

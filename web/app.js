@@ -15,6 +15,36 @@ async function api(path, payload) {
   if (!response.ok) throw new Error(data.error || "Não foi possível concluir a solicitação.");
   return data;
 }
+async function apiStream(path, payload, onEvent) {
+  const response = await fetch(path, {
+    method: "POST", headers: {"Content-Type": "application/json", "X-Lucios-Token": token},
+    body: JSON.stringify(payload)
+  });
+  if (!response.ok) {
+    const data = await response.json();
+    throw new Error(data.error || "Não foi possível iniciar a geração.");
+  }
+  if (!response.body) throw new Error("O navegador não recebeu o fluxo da resposta.");
+  const reader = response.body.getReader(), decoder = new TextDecoder();
+  let pending = "", finished = false;
+  try {
+    while (true) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      pending += decoder.decode(value, {stream: true});
+      let newline;
+      while ((newline = pending.indexOf("\n")) >= 0) {
+        const line = pending.slice(0, newline); pending = pending.slice(newline + 1);
+        if (!line) continue;
+        const event = JSON.parse(line);
+        onEvent(event);
+        if (event.type === "error") throw new Error(event.message || "Geração interrompida.");
+        if (event.type === "done") finished = true;
+      }
+    }
+    if (!finished) throw new Error("Conexão interrompida antes do fim da resposta.");
+  } finally { reader.releaseLock(); }
+}
 function toast(text, url) {
   clearTimeout(toastTimer);
   $("toast").replaceChildren(document.createTextNode(text));
@@ -42,6 +72,11 @@ function setBusy(value) {
 }
 function showWelcome(show) { $("welcome").hidden = !show; messages.hidden = show; }
 function scrollChat() { $("chatArea").scrollTop = $("chatArea").scrollHeight; }
+let followStream = true;
+$("chatArea").addEventListener("scroll", () => {
+  const area = $("chatArea");
+  followStream = area.scrollHeight - area.scrollTop - area.clientHeight < 90;
+});
 function addMessage(role, text) {
   const article = document.createElement("article"); article.className = `message ${role}`;
   const header = document.createElement("div"); header.className = "message-header";
@@ -51,6 +86,51 @@ function addMessage(role, text) {
   const content = document.createElement("div"); content.className = "markdown-body";
   if (role === "assistant") renderMarkdown(text, content); else content.textContent = text;
   article.append(header, content); messages.append(article); return article;
+}
+function streamingMessage(existingArticle = null) {
+  const article = existingArticle || addMessage("assistant", "");
+  $("chatArea").classList.toggle("streaming", true);
+  const content = article.children[1];
+  let accumulated = "", timer = null;
+  function paint() {
+    timer = null;
+    content.replaceChildren();
+    renderMarkdown(accumulated, content);
+    if (followStream) scrollChat();
+  }
+  return {
+    article,
+    append(part) {
+      accumulated += part;
+      if (timer === null) timer = setTimeout(paint, accumulated.length > 10000 ? 150 : 70);
+    },
+    finish() {
+      if (timer !== null) clearTimeout(timer);
+      paint();
+      $("chatArea").classList.toggle("streaming", false);
+    },
+    get text() { return accumulated; }
+  };
+}
+function failedStream(message, text, retryAction) {
+  const note = document.createElement("div"); note.className = "stream-error";
+  const label = document.createElement("span");
+  label.textContent = "Geração interrompida: " + message;
+  const retry = document.createElement("button");
+  retry.type = "button"; retry.textContent = "Tentar novamente";
+  retry.addEventListener("click", () => {
+    if (busy) return;
+    note.remove();
+    if (retryAction) retryAction();
+    else {
+      const last = Array.from(messages.children).slice(-2);
+      if (last[0]?.className === "message user" && last[1]?.className === "message assistant") {
+        last.forEach(item => item.remove());
+      }
+      promptInput.value = text; resizeInput(); $("chatForm").requestSubmit();
+    }
+  });
+  note.append(label, retry); messages.append(note); if (followStream) scrollChat();
 }
 function approvalCard(proposal, messageText) {
   pendingProposal = proposal;
@@ -114,6 +194,34 @@ function turnButton(label, glyph, callback) {
   button.addEventListener("click", callback);
   return button;
 }
+function addTurnActions(article, item, i, entries) {
+  if (!activeConversation?.editable || i < entries.length - 2) return;
+  const actions = document.createElement("div"); actions.className = "message-actions";
+  if (item.role === "user") {
+    actions.append(turnButton("Editar este prompt", "✎", beginEdit));
+  } else if (item.role === "assistant") {
+    actions.append(turnButton("Tentar outra resposta", "↻", () => mutateTurn("/api/retry")));
+    const alternatives = item.alternatives || [{content: item.content, model: null}];
+    const chosen = item.selected || 0;
+    if (alternatives.length > 1) {
+      const prev = turnButton("Resposta anterior", "‹", () => mutateTurn("/api/select-answer", {index: chosen - 1}));
+      prev.dataset.boundary = String(chosen === 0);
+      prev.disabled = busy || chosen === 0;
+      const count = document.createElement("span"); count.className = "answer-count";
+      count.textContent = `${chosen + 1} de ${alternatives.length}`;
+      const next = turnButton("Próxima resposta", "›", () => mutateTurn("/api/select-answer", {index: chosen + 1}));
+      next.dataset.boundary = String(chosen === alternatives.length - 1);
+      next.disabled = busy || chosen === alternatives.length - 1;
+      actions.append(prev, count, next);
+    }
+    const model = alternatives[chosen]?.model;
+    if (model) {
+      const tag = document.createElement("span"); tag.className = "answer-model";
+      tag.textContent = model; tag.title = `Resposta gerada por ${model}`; actions.append(tag);
+    }
+  }
+  article.append(actions);
+}
 function renderConversation() {
   messages.replaceChildren();
   if (!activeConversation) return;
@@ -121,32 +229,7 @@ function renderConversation() {
   for (let i = 0; i < entries.length; i++) {
     const item = entries[i];
     const article = addMessage(item.role, item.content);
-    if (!activeConversation.editable || i < entries.length - 2) continue;
-    const actions = document.createElement("div"); actions.className = "message-actions";
-    if (item.role === "user") {
-      actions.append(turnButton("Editar este prompt", "✎", beginEdit));
-    } else if (item.role === "assistant") {
-      actions.append(turnButton("Tentar outra resposta", "↻", () => mutateTurn("/api/retry")));
-      const alternatives = item.alternatives || [{content: item.content, model: null}];
-      const chosen = item.selected || 0;
-      if (alternatives.length > 1) {
-        const prev = turnButton("Resposta anterior", "‹", () => mutateTurn("/api/select-answer", {index: chosen - 1}));
-        prev.dataset.boundary = String(chosen === 0);
-        prev.disabled = busy || chosen === 0;
-        const count = document.createElement("span"); count.className = "answer-count";
-        count.textContent = `${chosen + 1} de ${alternatives.length}`;
-        const next = turnButton("Próxima resposta", "›", () => mutateTurn("/api/select-answer", {index: chosen + 1}));
-        next.dataset.boundary = String(chosen === alternatives.length - 1);
-        next.disabled = busy || chosen === alternatives.length - 1;
-        actions.append(prev, count, next);
-      }
-      const model = alternatives[chosen]?.model;
-      if (model) {
-        const tag = document.createElement("span"); tag.className = "answer-model";
-        tag.textContent = model; tag.title = `Resposta gerada por ${model}`; actions.append(tag);
-      }
-    }
-    article.append(actions);
+    addTurnActions(article, item, i, entries);
   }
   showWelcome(!entries.length);
   scrollChat();
@@ -154,16 +237,51 @@ function renderConversation() {
 async function mutateTurn(path, extra = {}) {
   if (busy || !activeConversation?.editable || (editing && path !== "/api/edit")) return false;
   const turn = activeConversation.editable_turn;
+  const streamRevision = path === "/api/retry" || path === "/api/edit";
+  const assistantArticle = Array.from(messages.children).filter(
+    node => node.className === "message assistant").at(-1);
+  let live = null;
   setBusy(true); renderRecent();
   try {
-    const data = await api(path, {conversation_id: currentId, turn, ...extra});
-    activeConversation = data.conversation;
+    if (streamRevision) {
+      let completed = null;
+      await apiStream("/api/turn-stream", {conversation_id: currentId, turn,
+        action: path === "/api/edit" ? "edit" : "retry", ...extra}, event => {
+        if (event.type === "delta") {
+          if (!live) live = streamingMessage(assistantArticle);
+          live.append(event.text);
+        } else if (event.type === "done") completed = event.conversation;
+      });
+      if (!live) {
+        live = streamingMessage(assistantArticle);
+        live.append(completed.messages.at(-1)?.content || "");
+      }
+      live.finish();
+      activeConversation = completed;
+      const entries = completed.messages, last = entries.length - 1;
+      const userArticle = Array.from(messages.children).filter(
+        node => node.className === "message user").at(-1);
+      if (path === "/api/edit") userArticle.children[1].textContent = entries[last - 1].content;
+      Array.from(userArticle.children).find(child => child.className === "message-actions")?.remove();
+      Array.from(assistantArticle.children).find(child => child.className === "message-actions")?.remove();
+      addTurnActions(userArticle, entries[last - 1], last - 1, entries);
+      addTurnActions(assistantArticle, entries[last], last, entries);
+    } else {
+      const data = await api(path, {conversation_id: currentId, turn, ...extra});
+      activeConversation = data.conversation;
+      renderConversation();
+    }
     editing = false;
-    renderConversation();
     $("chatTitle").textContent = activeConversation.title;
     await refreshRecent().catch(() => toast("Resposta salva. Não foi possível atualizar Recentes."));
     return true;
-  } catch (error) { toast(error.message); return false; }
+  } catch (error) {
+    if (live?.text) {
+      live.finish(); failedStream(error.message, extra.message || activeConversation.messages.at(-2).content,
+                                  () => mutateTurn(path, extra));
+    } else toast(error.message);
+    return false;
+  }
   finally { setBusy(false); renderRecent(); }
 }
 function beginEdit() {
@@ -348,13 +466,40 @@ function resizeInput() { promptInput.style.height = "auto"; promptInput.style.he
 $("chatForm").addEventListener("submit", async (event) => {
   event.preventDefault(); if (busy || pendingProposal) return;
   const text = promptInput.value.trim(); if (!text) return;
+  const area = $("chatArea");
+  const distance = area.scrollHeight - area.scrollTop - area.clientHeight;
+  followStream = !Number.isFinite(distance) || distance < 90;
   setBusy(true); renderRecent(); showWelcome(false);
   const userMessage = addMessage("user", text); const pending = typing();
+  let partial = null;
   promptInput.value = ""; resizeInput();
   try {
     if (!currentId) currentId = (await api("/api/new", {model: selectedModel})).id;
-    const data = await api(fileMode ? "/api/files/prepare" : "/api/chat",
-                           {message: text, conversation_id: currentId});
+    if (!fileMode) {
+      let completed = null;
+      await apiStream("/api/chat-stream", {message: text, conversation_id: currentId}, event => {
+        if (event.type === "delta") {
+          if (!partial) { pending.remove(); partial = streamingMessage(); }
+          partial.append(event.text);
+        } else if (event.type === "done") completed = event.conversation;
+      });
+      pending.remove();
+      if (!partial) {
+        partial = streamingMessage();
+        partial.append(completed.messages.at(-1)?.content || "");
+      }
+      partial.finish();
+      activeConversation = completed;
+      const entries = completed.messages, last = entries.length - 1;
+      for (const article of Array.from(messages.children).slice(0, -2)) {
+        Array.from(article.children).find(child => child.className === "message-actions")?.remove();
+      }
+      addTurnActions(userMessage, entries[last - 1], last - 1, entries);
+      addTurnActions(partial.article, entries[last], last, entries);
+      await refreshRecent().catch(() => toast("Resposta salva. Não foi possível atualizar Recentes."));
+      return;
+    }
+    const data = await api("/api/files/prepare", {message: text, conversation_id: currentId});
     pending.remove();
     if (data.proposal) {
       userMessage.remove();
@@ -369,8 +514,13 @@ $("chatForm").addEventListener("submit", async (event) => {
     }
     await refreshRecent().catch(() => toast("Resposta salva. Não foi possível atualizar a lista de recentes."));
   } catch (error) {
-    pending.remove(); userMessage.remove(); promptInput.value = text; resizeInput();
-    showWelcome(!messages.children.length); toast(error.message);
+    pending.remove();
+    if (partial?.text) {
+      partial.finish(); failedStream(error.message, text);
+    } else {
+      partial?.article.remove(); userMessage.remove(); promptInput.value = text; resizeInput();
+      showWelcome(!messages.children.length); toast(error.message);
+    }
   } finally { setBusy(false); renderRecent(); if (!pendingProposal) promptInput.focus(); }
 });
 $("fileModeBtn").addEventListener("click", () => {

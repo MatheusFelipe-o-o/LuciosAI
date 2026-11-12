@@ -17,6 +17,31 @@ class ConciliacaoTests(unittest.TestCase):
         self.agent.memory_manager = Mock()
 
     @patch("Agent.ollama.chat")
+    def test_stream_entrega_fragmentos_reais_e_salva_uma_vez(self, chat):
+        chat.return_value = iter([
+            {"message": {"content": "**Olá"}, "done": False},
+            {"message": {"content": "** mundo"}, "done": False},
+            {"message": {"content": ""}, "done": True, "eval_count": 2},
+        ])
+        parts = []
+        self.assertEqual(self.agent.chat("Oi", on_chunk=parts.append), "**Olá** mundo")
+        self.assertEqual(parts, ["**Olá", "** mundo"])
+        self.assertEqual(self.agent.conversa[-1]["content"], "**Olá** mundo")
+        self.assertTrue(chat.call_args.kwargs["stream"])
+
+    @patch("Agent.ollama.chat")
+    def test_stream_interrompido_nao_grava_turno(self, chat):
+        def stream():
+            yield {"message": {"content": "parcial"}, "done": False}
+            raise ConnectionError("conexão perdida")
+        chat.return_value = stream()
+        parts = []
+        reply = self.agent.chat("Oi", on_chunk=parts.append)
+        self.assertIn("conexão perdida", reply)
+        self.assertEqual(parts, ["parcial"])
+        self.assertEqual(self.agent.conversa, [])
+
+    @patch("Agent.ollama.chat")
     def test_conversa_comum_faz_uma_chamada_sem_ler_memoria(self, chat):
         chat.return_value = {"message": {"content": "**Olá!**"}}
         self.assertEqual(self.agent.chat("Olá, bom dia!"), "**Olá!**")

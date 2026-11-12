@@ -134,6 +134,10 @@ def _metricas_ollama(resposta):
     return metricas
 
 
+def _campo(objeto, nome, padrao=None):
+    return objeto.get(nome, padrao) if isinstance(objeto, dict) else getattr(objeto, nome, padrao)
+
+
 @dataclass
 class Resultado:
     estados: list[Estado] = field(default_factory=lambda: [Estado.RECEBIDO])
@@ -203,6 +207,27 @@ class ContextoExecucao:
             medicao.metricas = _metricas_ollama(resposta)
             self.verificar_limites()
         return resposta
+
+    def chamar_modelo_stream(self, on_chunk, etapa="inferencia", **parametros):
+        """Consome o iterador dentro da medição e entrega fragmentos reais do Ollama."""
+        self.verificar_limites()
+        if self.resultado.chamadas_modelo >= self.config.limite_chamadas:
+            raise RuntimeError("Limite de chamadas ao modelo atingido.")
+        self.resultado.chamadas_modelo += 1
+        partes = []
+        with self.medir(etapa) as medicao:
+            _notificar({"fase": "modelo", "etapa": "/".join(_caminho_medicoes.get()),
+                        "modelo": parametros.get("model")})
+            for chunk in self._chamar_modelo(stream=True, **parametros):
+                self.verificar_limites()
+                fragmento = _campo(_campo(chunk, "message", {}), "content", "") or ""
+                if fragmento:
+                    partes.append(fragmento)
+                    on_chunk(fragmento)
+                if _campo(chunk, "done", False):
+                    medicao.metricas = _metricas_ollama(chunk)
+            self.verificar_limites()
+        return "".join(partes)
 
 
 def _normalizar(texto):

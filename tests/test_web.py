@@ -66,6 +66,61 @@ class WebTests(unittest.TestCase):
             self.assertEqual(self.get(path)[0], 200)
         self.assertEqual(self.get("/../Agent.py")[0], 404)
 
+    def test_chat_stream_envia_fragmentos_e_conclui_uma_vez(self):
+        identifier = self.post("/api/new")[1]["id"]
+        self.cliente.chat.return_value = iter([
+            {"message": {"content": "Olá "}, "done": False},
+            {"message": {"content": "mundo"}, "done": False},
+            {"message": {"content": ""}, "done": True},
+        ])
+        conn = HTTPConnection("127.0.0.1", self.servidor.server_port, timeout=3)
+        self.addCleanup(conn.close)
+        conn.request("POST", "/api/chat-stream",
+                     json.dumps({"message": "Oi", "conversation_id": identifier}),
+                     {"Content-Type": "application/json", "X-Lucios-Token": self.servidor.token})
+        response = conn.getresponse()
+        self.assertEqual(response.status, 200)
+        self.assertIn("application/x-ndjson", response.getheader("Content-Type"))
+        events = [json.loads(line) for line in response.read().decode("utf-8").splitlines()]
+        self.assertEqual([event["type"] for event in events], ["delta", "delta", "done"])
+        self.assertEqual("".join(event["text"] for event in events if event["type"] == "delta"),
+                         "Olá mundo")
+        self.assertEqual(len(self.servidor.store.get(identifier)["messages"]), 2)
+
+    def test_chat_stream_falha_preserva_fragmento_sem_salvar_turno(self):
+        identifier = self.post("/api/new")[1]["id"]
+        def interrupted():
+            yield {"message": {"content": "parcial"}, "done": False}
+            raise ConnectionError("perdida")
+        self.cliente.chat.return_value = interrupted()
+        conn = HTTPConnection("127.0.0.1", self.servidor.server_port, timeout=3)
+        self.addCleanup(conn.close)
+        conn.request("POST", "/api/chat-stream",
+                     json.dumps({"message": "Oi", "conversation_id": identifier}),
+                     {"Content-Type": "application/json", "X-Lucios-Token": self.servidor.token})
+        events = [json.loads(line) for line in conn.getresponse().read().decode("utf-8").splitlines()]
+        self.assertEqual([event["type"] for event in events], ["delta", "error"])
+        self.assertEqual(events[0]["text"], "parcial")
+        self.assertEqual(self.servidor.store.get(identifier)["messages"], [])
+
+    def test_repetir_resposta_por_stream_mantem_versoes(self):
+        identifier = self.post("/api/new")[1]["id"]
+        self.post(corpo={"message": "Pergunta", "conversation_id": identifier})
+        self.cliente.chat.return_value = iter([
+            {"message": {"content": "Nova "}, "done": False},
+            {"message": {"content": "versão"}, "done": True},
+        ])
+        conn = HTTPConnection("127.0.0.1", self.servidor.server_port, timeout=3)
+        self.addCleanup(conn.close)
+        conn.request("POST", "/api/turn-stream",
+                     json.dumps({"action": "retry", "turn": 0, "conversation_id": identifier}),
+                     {"Content-Type": "application/json", "X-Lucios-Token": self.servidor.token})
+        events = [json.loads(line) for line in conn.getresponse().read().decode("utf-8").splitlines()]
+        self.assertEqual([e["type"] for e in events], ["delta", "delta", "done"])
+        saved = self.servidor.store.get(identifier)["messages"][-1]
+        self.assertEqual(len(saved["alternatives"]), 2)
+        self.assertEqual(saved["content"], "Nova versão")
+
     def test_acao_em_arquivo_exige_confirmacao_e_recusa_replay(self):
         from file_actions import FileActions
         with TemporaryDirectory() as folder:

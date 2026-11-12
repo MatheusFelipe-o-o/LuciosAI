@@ -107,6 +107,13 @@ def resposta_com_modelo(message, model):
     return agent.chat(message, modelo_resposta=model)
 
 
+def resposta_stream(message, model, on_chunk):
+    if model == "auto":
+        return agent.chat(message, on_chunk=on_chunk)
+    validar_modelo(model)
+    return agent.chat(message, modelo_resposta=model, on_chunk=on_chunk)
+
+
 def turno_editavel(item):
     messages, context = item["messages"], item["context"]
     return (len(messages) >= 2 and len(context) >= 2
@@ -258,6 +265,12 @@ class LuciosWebHandler(BaseHTTPRequestHandler):
             if self.path == "/api/files/decide":
                 self.decide_file_action(payload)
                 return
+            if self.path == "/api/chat-stream":
+                self.stream_chat(payload)
+                return
+            if self.path == "/api/turn-stream":
+                self.stream_turn(payload)
+                return
             if self.path == "/api/lab":
                 try:
                     self.send_json({"url": self.server.open_lab()})
@@ -357,6 +370,107 @@ class LuciosWebHandler(BaseHTTPRequestHandler):
                 "proposal": proposal, "public": public, "message": message.strip(),
                 "updated": item["updated"], "expires": time.monotonic() + 600}
             self.send_json({"proposal": public})
+
+    def stream_chat(self, payload):
+        message = payload.get("message")
+        if (not isinstance(message, str) or not message.strip()
+                or len(message) > agent.configuracao.limite_entrada):
+            raise ChatActionError("Mensagem inválida ou acima do limite de tamanho.")
+        identifier = payload.get("conversation_id")
+        with agent_lock:
+            conversation = self.server.store.get(identifier)
+            agent.clear_memory()
+            agent.conversa = conversation["context"]
+            self.server.active_conversation_id = identifier
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            def send_event(event):
+                self.wfile.write((json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8"))
+                self.wfile.flush()
+            try:
+                reply = resposta_stream(message, conversation["model"],
+                                        lambda part: send_event({"type": "delta", "text": part}))
+                state = agent.ultimo_resultado.estado
+                if state != Estado.CONCLUIDO:
+                    send_event({"type": "error", "message": reply})
+                    return
+                conversation["messages"].extend([
+                    {"role": "user", "content": message.strip()},
+                    {"role": "assistant", "content": reply,
+                     "alternatives": [{"content": reply,
+                                       "model": agent.ultimo_resultado.decisao.modelo}],
+                     "selected": 0}])
+                self.server.store.save(conversation, agent.conversa)
+                send_event({"type": "done", "conversation": publico(conversation)})
+            except (BrokenPipeError, ConnectionResetError):
+                return
+            except Exception:
+                try:
+                    send_event({"type": "error", "message": "A geração foi interrompida. Tente novamente."})
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+    def stream_turn(self, payload):
+        action = payload.get("action")
+        if action not in ("retry", "edit"):
+            raise ChatActionError("Ação de revisão inválida.")
+        message = payload.get("message") if action == "edit" else None
+        if action == "edit" and (not isinstance(message, str) or not message.strip()
+                                  or len(message) > agent.configuracao.limite_entrada):
+            raise ChatActionError("Mensagem inválida ou acima do limite de tamanho.")
+        identifier, turn = payload.get("conversation_id"), payload.get("turn")
+        with agent_lock:
+            item = self.server.store.get(identifier)
+            if type(turn) is not int or turn != len(item["messages"]) - 2:
+                raise ChatActionError("Esse prompt já possui uma continuação.", 409)
+            answer = ultima_resposta(item)
+            text = message.strip() if action == "edit" else item["messages"][-2]["content"]
+            agent.clear_memory()
+            agent.conversa = item["context"][:-2]
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            def send_event(event):
+                self.wfile.write((json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8"))
+                self.wfile.flush()
+            try:
+                reply = resposta_stream(text, item["model"],
+                                        lambda part: send_event({"type": "delta", "text": part}))
+                state = agent.ultimo_resultado.estado
+                if state != Estado.CONCLUIDO:
+                    agent.conversa = item["context"]
+                    send_event({"type": "error", "message": reply})
+                    return
+                alternative = {"content": reply, "model": agent.ultimo_resultado.decisao.modelo}
+                if action == "edit":
+                    item["messages"][-2]["content"] = text
+                    answer["alternatives"] = [alternative]
+                    answer["selected"] = 0
+                else:
+                    answer["alternatives"].append(alternative)
+                    answer["selected"] = len(answer["alternatives"]) - 1
+                answer["content"] = reply
+                item["context"] = agent.conversa
+                self.server.store.save(item, item["context"])
+                self.server.active_conversation_id = identifier
+                send_event({"type": "done", "conversation": publico(item)})
+            except (BrokenPipeError, ConnectionResetError):
+                agent.conversa = item["context"]
+            except Exception:
+                agent.conversa = item["context"]
+                try:
+                    send_event({"type": "error", "message": "A geração foi interrompida. Tente novamente."})
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
 
     def decide_file_action(self, payload):
         identifier, proposal_id, confirm = (payload.get("conversation_id"),

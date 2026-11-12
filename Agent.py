@@ -258,11 +258,14 @@ class LuciosAgent:
             return {"acao": "nenhuma", "consulta": ""}
         return {"acao": acao, "consulta": consulta.strip()}
 
-    def chat(self, user_input: str, cancelar=None, *, modelo_resposta=None):
+    def chat(self, user_input: str, cancelar=None, *, modelo_resposta=None, on_chunk=None):
         """Mantém a API textual das interfaces, delegando o fluxo ao orquestrador."""
         inicio_chat = time.perf_counter()
         resultado = self.orquestrador.executar(
-            user_input, self._responder, self.clear_memory, cancelar,
+            user_input,
+            (lambda texto, modelo, contexto: self._responder(texto, modelo, contexto, on_chunk))
+            if on_chunk is not None else self._responder,
+            self.clear_memory, cancelar,
             modelo_resposta=modelo_resposta
         )
         try:
@@ -281,7 +284,7 @@ class LuciosAgent:
         finally:
             resultado.duracao_chat = time.perf_counter() - inicio_chat
 
-    def _responder(self, user_input: str, modelo: str, contexto):
+    def _responder(self, user_input: str, modelo: str, contexto, on_chunk=None):
         """Prepara memória e prompt; o resultado só entra na conversa após verificação."""
         with contexto.medir("classificacao_memoria"):
             intencao_memoria = self._classificar_pedido_memoria(user_input, contexto)
@@ -367,12 +370,13 @@ class LuciosAgent:
                 {"role": "user", "content": user_input},
             ]
 
+        if on_chunk is not None:
+            return contexto.chamar_modelo_stream(
+                on_chunk, etapa="inferencia_resposta", model=modelo,
+                messages=mensagens, options=self.opcoes_modelo)
         response = contexto.chamar_modelo(
-            etapa="inferencia_resposta",
-            model=modelo,
-            messages=mensagens,
-            options=self.opcoes_modelo,
-        )
+            etapa="inferencia_resposta", model=modelo,
+            messages=mensagens, options=self.opcoes_modelo)
         with contexto.medir("leitura_resposta"):
             mensagem = _campo(response, "message", {})
             resposta = _campo(mensagem, "content", "") or ""
