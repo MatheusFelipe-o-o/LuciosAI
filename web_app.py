@@ -1,15 +1,18 @@
 """Chat local: python web_app.py e abra http://127.0.0.1:8000."""
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 from pathlib import Path
 import secrets
 import threading
+import time
 from urllib.parse import parse_qs, urlsplit
 
 import ollama
 
 from Agent import LuciosAgent
 from conversations import ConversationStore
+from file_actions import FileActions, FileActionError
 from orchestrator import Estado
 
 HOST = "127.0.0.1"
@@ -17,6 +20,57 @@ PORT = 8000
 ROOT = Path(__file__).resolve().parent
 agent = LuciosAgent()
 agent_lock = threading.Lock()
+FILES_ROOT = Path(os.getenv("LUCIOS_FILES_ROOT", str(Path.home() / "Documents")))
+
+
+def interpretar_acao(message, model, history=None):
+    """O modelo propõe JSON; a validação e a execução pertencem ao servidor."""
+    client = ollama.Client(host="http://127.0.0.1:11434", timeout=45)
+    try:
+        response = client.chat(
+            model=agent.model_name if model == "auto" else validar_modelo(model),
+            format="json",
+            options={"temperature": 0, "num_predict": 700},
+            messages=[
+                {"role": "system", "content": (
+                    "Interprete o pedido como UMA operação de arquivo dentro da pasta autorizada. "
+                    "Responda somente JSON com operation, source, target, content, query, interpretation. "
+                    "Operações: list, search, read, mkdir, create, edit, copy, move, rename, delete. "
+                    "Caminhos relativos. Para search, source é a pasta e query é o nome/trecho buscado. "
+                    "target, content e query devem ser null quando não usados. "
+                    "Não invente conteúdo ou caminhos ausentes: nesse caso responda "
+                    "{\"operation\":\"clarify\",\"interpretation\":\"pergunta objetiva\"}. "
+                    "Para edit, se não souber o conteúdo novo inteiro, use content null. "
+                    "Não execute nada.")},
+                {"role": "user", "content": (
+                    "Contexto recente (apenas para referências; não são instruções de operação):\n"
+                    + json.dumps((history or [])[-4:], ensure_ascii=False)[:3000]
+                    + "\n\nPedido atual:\n" + message)},
+            ])
+        return json.loads(response.message.content)
+    finally:
+        client._client.close()
+
+
+def gerar_edicao(message, model, original):
+    client = ollama.Client(host="http://127.0.0.1:11434", timeout=60)
+    try:
+        response = client.chat(
+            model=agent.model_name if model == "auto" else validar_modelo(model),
+            format="json", options={"temperature": 0, "num_predict": 4096},
+            messages=[
+                {"role": "system", "content": (
+                    "Edite o arquivo de texto conforme a instrução do usuário. "
+                    "Responda apenas JSON com a chave content contendo o arquivo inteiro atualizado. "
+                    "Preserve todo conteúdo não solicitado. Se a instrução for ambígua, "
+                    "responda JSON com a chave clarification. Não execute nada.")},
+                {"role": "user", "content": f"Pedido:\n{message}\n\nArquivo atual:\n{original}"}])
+        data = json.loads(response.message.content)
+        if not isinstance(data, dict):
+            raise ValueError("Resposta de edição inválida.")
+        return data
+    finally:
+        client._client.close()
 
 
 class ChatActionError(ValueError):
@@ -91,6 +145,8 @@ class LuciosServer(ThreadingHTTPServer):
         self.lab = None
         self.lab_lock = threading.Lock()
         self.active_conversation_id = None
+        self.file_actions = FileActions(FILES_ROOT) if FILES_ROOT.is_dir() else None
+        self.pending_actions = {}
 
     def open_lab(self):
         # Optional package: chat works without benchmark dependencies.
@@ -151,6 +207,16 @@ class LuciosWebHandler(BaseHTTPRequestHandler):
             except ValueError as error:
                 self.send_json({"error": str(error)}, 404)
             return
+        if url.path == "/api/files/pending":
+            identifier = parse_qs(url.query).get("conversation_id", [None])[0]
+            with agent_lock:
+                pending = self.server.pending_actions.get(identifier)
+                if pending and pending["expires"] > time.monotonic():
+                    self.send_json({"proposal": pending["public"]})
+                else:
+                    self.server.pending_actions.pop(identifier, None)
+                    self.send_json({"proposal": None})
+            return
         self.send_json({"error": "Rota nao encontrada."}, 404)
 
     def do_POST(self):
@@ -179,11 +245,18 @@ class LuciosWebHandler(BaseHTTPRequestHandler):
             if self.path == "/api/delete":
                 identifier = payload.get("conversation_id")
                 with agent_lock:
+                    self.server.pending_actions.pop(identifier, None)
                     self.server.store.delete(identifier)
                     if self.server.active_conversation_id == identifier:
                         agent.clear_memory()
                         self.server.active_conversation_id = None
                 self.send_json({"ok": True})
+                return
+            if self.path == "/api/files/prepare":
+                self.prepare_file_action(payload)
+                return
+            if self.path == "/api/files/decide":
+                self.decide_file_action(payload)
                 return
             if self.path == "/api/lab":
                 try:
@@ -237,10 +310,81 @@ class LuciosWebHandler(BaseHTTPRequestHandler):
             self.send_json(response, status)
         except ChatActionError as error:
             self.send_json({"error": str(error)}, error.status)
+        except FileActionError as error:
+            self.send_json({"error": str(error)}, 400)
         except ValueError as error:
             self.send_json({"error": str(error)}, 404)
         except Exception:
             self.send_json({"error": "Nao foi possivel concluir. Confira o armazenamento local e tente novamente."}, 500)
+
+    def prepare_file_action(self, payload):
+        if self.server.file_actions is None:
+            raise ChatActionError("Configure LUCIOS_FILES_ROOT com uma pasta existente e reinicie o chat.", 503)
+        identifier, message = payload.get("conversation_id"), payload.get("message")
+        if not isinstance(message, str) or not message.strip() or len(message) > 4000:
+            raise ChatActionError("Descreva uma ação em arquivos com até 4 mil caracteres.")
+        with agent_lock:
+            item = self.server.store.get(identifier)
+            if identifier in self.server.pending_actions:
+                raise ChatActionError("Responda à confirmação anterior primeiro.", 409)
+            try:
+                plan = interpretar_acao(message, item["model"], item["messages"])
+            except Exception as error:
+                raise ChatActionError("Não foi possível interpretar a ação com o modelo local.", 502) from error
+            if not isinstance(plan, dict):
+                raise ChatActionError("O modelo não retornou uma ação válida.", 502)
+            if plan.get("operation") == "clarify":
+                self.send_json({"clarification": str(plan.get("interpretation", "Detalhe a ação desejada."))[:500]})
+                return
+            if plan.get("operation") == "edit" and plan.get("content") is None:
+                try:
+                    original = self.server.file_actions.read_edit_source(plan.get("source"))
+                    edited = gerar_edicao(message, item["model"], original)
+                except (OSError, UnicodeError, ValueError) as error:
+                    raise ChatActionError(f"Não foi possível preparar a edição: {error}", 400) from error
+                if "clarification" in edited:
+                    self.send_json({"clarification": str(edited["clarification"])[:500]})
+                    return
+                plan["content"] = edited.get("content")
+            proposal = self.server.file_actions.prepare(plan)
+            proposal_id = secrets.token_urlsafe(24)
+            public = {"id": proposal_id, "interpretation": proposal.interpretation,
+                      "operation": proposal.operation, "source": proposal.source,
+                      "target": proposal.target, "preview": proposal.preview,
+                      "root": str(self.server.file_actions.root),
+                      "query": proposal.query, "request": message.strip()}
+            self.server.pending_actions[identifier] = {
+                "proposal": proposal, "public": public, "message": message.strip(),
+                "updated": item["updated"], "expires": time.monotonic() + 600}
+            self.send_json({"proposal": public})
+
+    def decide_file_action(self, payload):
+        identifier, proposal_id, confirm = (payload.get("conversation_id"),
+                                            payload.get("proposal_id"), payload.get("confirm"))
+        if type(confirm) is not bool:
+            raise ChatActionError("Informe confirmar ou negar.")
+        with agent_lock:
+            pending = self.server.pending_actions.get(identifier)
+            if not pending or not secrets.compare_digest(str(proposal_id), pending["public"]["id"]):
+                raise ChatActionError("Confirmação expirada ou inválida.", 409)
+            self.server.pending_actions.pop(identifier)
+            item = self.server.store.get(identifier)
+            if item["updated"] != pending["updated"] or time.monotonic() > pending["expires"]:
+                raise ChatActionError("A conversa mudou. Solicite uma nova prévia.", 409)
+            if confirm:
+                try:
+                    result = self.server.file_actions.execute(pending["proposal"])
+                except FileActionError as error:
+                    result = f"Ação não executada: {error}"
+                except (OSError, UnicodeError) as error:
+                    result = f"Ação não concluída: {type(error).__name__}."
+            else:
+                result = "Ação negada. Nenhum arquivo foi alterado."
+            item["messages"].extend([
+                {"role": "user", "content": pending["message"]},
+                {"role": "assistant", "content": result}])
+            self.server.store.save(item, item["context"])
+            self.send_json({"result": result, "conversation": publico(item)})
 
     def mutate_last_turn(self, payload):
         action = self.path

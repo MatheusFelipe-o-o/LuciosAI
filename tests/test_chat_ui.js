@@ -43,6 +43,16 @@ const context={console,document,setTimeout:()=>0,clearTimeout:()=>{},window:{con
       return {ok:true,json:async()=>item};
     }
     if(path==='/api/model'){conversation.model=body.model;return {ok:true,json:async()=>({model:body.model})};}
+    if(path==='/api/files/prepare'){
+      return {ok:true,json:async()=>({proposal:{id:'proposal-one',interpretation:'Criar uma nota de teste',
+        operation:'create',source:'nota.md',target:null,root:'Documentos',preview:'create: nota.md',
+        request:body.message}})};
+    }
+    if(path==='/api/files/decide'){
+      conversation.messages.push({role:'user',content:'Crie uma nota'},
+        {role:'assistant',content:body.confirm?'Ação concluída':'Ação negada'});
+      return {ok:true,json:async()=>({result:'Ação concluída',conversation})};
+    }
     if(path==='/api/chat'){
       if(failChat)return {ok:false,json:async()=>({error:'Modelo indisponível'})};
       const reply='**Resposta**\n\n- Item';
@@ -165,6 +175,17 @@ async function main(){
   await deleteButton().events.click();
   assert.equal(entries.length,0);assert.equal(el('messages').children.length,0);
   assert.equal(el('welcome').hidden,false);assert.equal(el('recentCount').textContent,'0');
+  el('fileModeBtn').events.click();
+  assert.equal(el('fileModeBtn')['aria-pressed'],'true');
+  el('prompt').value='Crie uma nota';
+  await el('chatForm').events.submit({preventDefault(){}});
+  const card=el('messages').children.at(-1);
+  assert.equal(card.className,'approval-card');
+  assert.match(card.textContent,/Criar uma nota de teste/);
+  assert.equal(requests.filter(r=>r.path==='/api/files/decide').length,0);
+  await card.children.at(-1).children[1].events.click();
+  assert.equal(requests.filter(r=>r.path==='/api/files/decide').length,1);
+  assert.match(el('messages').textContent,/Ação concluída/);
   console.log('Chat UI: flows, recent search, safe Markdown, errors, lab and mobile menu passed.');
 }
 main().catch(error=>{console.error(error);process.exitCode=1;});

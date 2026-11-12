@@ -3,6 +3,7 @@ const $ = (id) => document.getElementById(id);
 const token = document.querySelector('meta[name="lucios-token"]').content;
 let currentId = null, recent = [], busy = true, labBusy = false, toastTimer;
 let activeConversation = null, selectedModel = "auto", editing = false, defaultModel = "Modelo local";
+let fileMode = false, pendingProposal = null;
 const promptInput = $("prompt"), messages = $("messages");
 
 async function api(path, payload) {
@@ -26,9 +27,9 @@ function toast(text, url) {
 }
 function setBusy(value) {
   busy = value;
-  for (const id of ["sendBtn", "newBtn", "modelBtn"]) $(id).disabled = value;
-  promptInput.disabled = value || editing;
-  $("sendBtn").disabled = value || editing;
+  for (const id of ["sendBtn", "newBtn", "modelBtn", "fileModeBtn"]) $(id).disabled = value;
+  promptInput.disabled = value || editing || !!pendingProposal;
+  $("sendBtn").disabled = value || editing || !!pendingProposal;
   $("endBtn").disabled = value || !currentId || !messages.children.length;
   messages.querySelectorAll?.("[data-turn-action]").forEach(button => {
     button.disabled = value || editing || button.dataset.boundary === "true";
@@ -50,6 +51,58 @@ function addMessage(role, text) {
   const content = document.createElement("div"); content.className = "markdown-body";
   if (role === "assistant") renderMarkdown(text, content); else content.textContent = text;
   article.append(header, content); messages.append(article); return article;
+}
+function approvalCard(proposal, messageText) {
+  pendingProposal = proposal;
+  showWelcome(false);
+  if (messageText) addMessage("user", messageText);
+  const card = document.createElement("section"); card.className = "approval-card";
+  card.setAttribute("aria-labelledby", "approval-title");
+  const eyebrow = document.createElement("div"); eyebrow.className = "approval-eyebrow";
+  eyebrow.textContent = "Aguardando sua decisão";
+  const title = document.createElement("h2"); title.id = "approval-title"; title.tabIndex = -1;
+  title.textContent = "Confirmar ação";
+  const understood = document.createElement("p");
+  const intro = document.createElement("strong"); intro.textContent = "Entendi seu pedido assim: ";
+  understood.append(intro, document.createTextNode(proposal.interpretation));
+  const details = document.createElement("div"); details.className = "approval-details";
+  for (const [label, value] of [["Ação", proposal.operation], ["Pasta autorizada", proposal.root],
+                                ["Origem", proposal.source], ["Destino", proposal.target],
+                                ["Busca", proposal.query]]) {
+    if (!value) continue;
+    const row = document.createElement("div");
+    const name = document.createElement("span"); name.textContent = label + ": ";
+    row.append(name, document.createTextNode(value)); details.append(row);
+  }
+  const preview = document.createElement("pre"); preview.className = "approval-preview";
+  preview.textContent = proposal.preview || "Sem prévia de conteúdo.";
+  const actions = document.createElement("div"); actions.className = "approval-actions";
+  const deny = document.createElement("button"); deny.type = "button"; deny.className = "approval-deny";
+  deny.textContent = "Negar";
+  const confirm = document.createElement("button"); confirm.type = "button"; confirm.className = "approval-confirm";
+  confirm.textContent = "Confirmar";
+  deny.addEventListener("click", () => decideFileAction(false));
+  confirm.addEventListener("click", () => decideFileAction(true));
+  actions.append(deny, confirm); card.append(eyebrow, title, understood, details, preview, actions);
+  messages.append(card); scrollChat(); title.focus();
+  setBusy(false);
+}
+async function decideFileAction(confirm) {
+  if (busy || !pendingProposal || !currentId) return;
+  const proposal = pendingProposal;
+  setBusy(true);
+  try {
+    const data = await api("/api/files/decide", {conversation_id: currentId,
+      proposal_id: proposal.id, confirm});
+    pendingProposal = null;
+    activeConversation = data.conversation;
+    renderConversation();
+    await refreshRecent();
+    toast(data.result);
+  } catch (error) {
+    pendingProposal = null; messages.querySelector(".approval-card")?.remove();
+    toast(error.message);
+  } finally { setBusy(false); renderRecent(); promptInput.focus(); }
 }
 function turnButton(label, glyph, callback) {
   const button = document.createElement("button");
@@ -271,6 +324,9 @@ async function openConversation(id) {
     currentId = data.id; activeConversation = data;
     selectedModel = data.model || "auto"; updateModelLabel();
     editing = false; renderConversation();
+    pendingProposal = null;
+    const pending = await api(`/api/files/pending?conversation_id=${encodeURIComponent(id)}`);
+    if (pending.proposal) approvalCard(pending.proposal, pending.proposal.request);
     $("chatTitle").textContent = data.title;
     promptInput.value = ""; resizeInput();
     if (window.matchMedia("(max-width: 760px)").matches) sidebar(false);
@@ -280,7 +336,7 @@ async function openConversation(id) {
 }
 function newChat() {
   if (busy) return;
-  currentId = null; activeConversation = null; editing = false;
+  currentId = null; activeConversation = null; editing = false; pendingProposal = null;
   selectedModel = "auto"; updateModelLabel(); closeModelMenu();
   messages.replaceChildren(); showWelcome(true);
   $("chatTitle").textContent = "Nova conversa"; promptInput.value = ""; resizeInput();
@@ -290,16 +346,22 @@ function newChat() {
 }
 function resizeInput() { promptInput.style.height = "auto"; promptInput.style.height = `${Math.min(170, promptInput.scrollHeight)}px`; }
 $("chatForm").addEventListener("submit", async (event) => {
-  event.preventDefault(); if (busy) return;
+  event.preventDefault(); if (busy || pendingProposal) return;
   const text = promptInput.value.trim(); if (!text) return;
   setBusy(true); renderRecent(); showWelcome(false);
   const userMessage = addMessage("user", text); const pending = typing();
   promptInput.value = ""; resizeInput();
   try {
     if (!currentId) currentId = (await api("/api/new", {model: selectedModel})).id;
-    const data = await api("/api/chat", {message: text, conversation_id: currentId});
+    const data = await api(fileMode ? "/api/files/prepare" : "/api/chat",
+                           {message: text, conversation_id: currentId});
     pending.remove();
-    if (data.conversation) {
+    if (data.proposal) {
+      userMessage.remove();
+      approvalCard(data.proposal, text);
+    } else if (data.clarification) {
+      addMessage("assistant", data.clarification); scrollChat();
+    } else if (data.conversation) {
       activeConversation = data.conversation;
       renderConversation();
     } else {
@@ -309,7 +371,15 @@ $("chatForm").addEventListener("submit", async (event) => {
   } catch (error) {
     pending.remove(); userMessage.remove(); promptInput.value = text; resizeInput();
     showWelcome(!messages.children.length); toast(error.message);
-  } finally { setBusy(false); renderRecent(); promptInput.focus(); }
+  } finally { setBusy(false); renderRecent(); if (!pendingProposal) promptInput.focus(); }
+});
+$("fileModeBtn").addEventListener("click", () => {
+  if (busy || pendingProposal) return;
+  fileMode = !fileMode;
+  $("fileModeBtn").setAttribute("aria-pressed", String(fileMode));
+  $("composerMode").textContent = fileMode ? "/ Arquivos" : "/ Conversa";
+  promptInput.placeholder = fileMode ? "Descreva a ação em arquivos…" : "O que vamos construir hoje?";
+  promptInput.focus();
 });
 promptInput.addEventListener("input", resizeInput);
 promptInput.addEventListener("keydown", (event) => {

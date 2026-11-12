@@ -66,6 +66,35 @@ class WebTests(unittest.TestCase):
             self.assertEqual(self.get(path)[0], 200)
         self.assertEqual(self.get("/../Agent.py")[0], 404)
 
+    def test_acao_em_arquivo_exige_confirmacao_e_recusa_replay(self):
+        from file_actions import FileActions
+        with TemporaryDirectory() as folder:
+            original = self.servidor.file_actions
+            self.servidor.file_actions = FileActions(folder)
+            self.addCleanup(setattr, self.servidor, "file_actions", original)
+            identifier = self.post("/api/new")[1]["id"]
+            plan = {"operation": "create", "source": "nota.md", "target": None,
+                    "content": "Conteúdo", "interpretation": "Criar uma nota."}
+            with patch.object(web_app, "interpretar_acao", return_value=plan):
+                status, data = self.post("/api/files/prepare", {
+                    "conversation_id": identifier, "message": "Crie uma nota"})
+            self.assertEqual(status, 200)
+            proposal_id = data["proposal"]["id"]
+            self.assertFalse((Path(folder) / "nota.md").exists())
+            self.assertEqual(self.post("/api/files/decide", {
+                "conversation_id": identifier, "proposal_id": proposal_id, "confirm": False})[0], 200)
+            self.assertFalse((Path(folder) / "nota.md").exists())
+            with patch.object(web_app, "interpretar_acao", return_value=plan):
+                proposal_id = self.post("/api/files/prepare", {
+                    "conversation_id": identifier, "message": "Crie uma nota"})[1]["proposal"]["id"]
+            status, result = self.post("/api/files/decide", {
+                "conversation_id": identifier, "proposal_id": proposal_id, "confirm": True})
+            self.assertEqual(status, 200)
+            self.assertEqual((Path(folder) / "nota.md").read_text(encoding="utf-8"), "Conteúdo")
+            self.assertEqual(len(result["conversation"]["messages"]), 4)
+            self.assertEqual(self.post("/api/files/decide", {
+                "conversation_id": identifier, "proposal_id": proposal_id, "confirm": True})[0], 409)
+
     def test_isola_conversas_e_reabre_contexto(self):
         a = self.post("/api/new")[1]["id"]
         b = self.post("/api/new")[1]["id"]
