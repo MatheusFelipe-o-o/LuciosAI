@@ -181,6 +181,21 @@ class WebTests(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertEqual(answer["result"], "Novo")
 
+    def test_interpretacao_ausente_recebe_descricao_da_operacao(self):
+        from file_actions import FileActions
+        with TemporaryDirectory() as folder:
+            original = self.servidor.file_actions
+            self.servidor.file_actions = FileActions(folder)
+            self.addCleanup(setattr, self.servidor, "file_actions", original)
+            identifier = self.post("/api/new")[1]["id"]
+            plan = {"operation": "search", "source": ".", "query": "curriculo",
+                    "target": None, "content": None}
+            with patch.object(web_app, "interpretar_acao", return_value=plan):
+                status, data = self.post("/api/files/prepare", {
+                    "conversation_id": identifier, "message": "Quantos currículos há?"})
+            self.assertEqual(status, 200)
+            self.assertIn("informar a quantidade", data["proposal"]["interpretation"])
+
     def test_isola_conversas_e_reabre_contexto(self):
         a = self.post("/api/new")[1]["id"]
         b = self.post("/api/new")[1]["id"]

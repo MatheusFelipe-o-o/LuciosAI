@@ -437,6 +437,21 @@ class LuciosWebHandler(BaseHTTPRequestHandler):
             if plan.get("operation") == "clarify":
                 self.send_json({"clarification": str(plan.get("interpretation", "Detalhe a ação desejada."))[:500]})
                 return
+            if not isinstance(plan.get("interpretation"), str) or not plan["interpretation"].strip():
+                action = plan.get("operation")
+                if action == "search":
+                    plan["interpretation"] = (
+                        f"Buscar arquivos relacionados a “{plan.get('query', '')}” "
+                        f"em “{plan.get('source', '.')}” e informar a quantidade encontrada."
+                    )
+                else:
+                    names = {"read": "ler", "list": "listar", "mkdir": "criar pasta",
+                             "create": "criar arquivo", "edit": "editar", "copy": "copiar",
+                             "move": "mover", "rename": "renomear", "delete": "excluir"}
+                    plan["interpretation"] = (
+                        f"Você pediu para {names.get(action, 'operar')} “{plan.get('source', '')}”. "
+                        "Confira a ação e o caminho antes de confirmar."
+                    )
             if plan.get("operation") in {"read", "edit", "copy", "move", "rename", "delete"} and plan.get("query"):
                 candidates = self.server.file_actions.find_candidates(plan.get("source"), plan["query"])
                 if not candidates:
