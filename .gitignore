@@ -9,11 +9,22 @@ venv/
 .env.*
 !.env.example
 .vscode/
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+
+# Local project notes and method configuration
+*.md
+PROJECT_METHOD.yaml
 
 # Private runtime conversation data
 memoria_lucios.txt
 memoria_lucios.json
 local_data/
+*.sqlite3
+*.db
 
 # Test and tooling caches
 .pytest_cache/
