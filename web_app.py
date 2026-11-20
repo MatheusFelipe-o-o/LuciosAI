@@ -15,7 +15,6 @@ from Agent import LuciosAgent
 from conversations import ConversationStore
 from file_actions import FileActions, FileActionError
 from orchestrator import Estado
-from thinking import describe as describe_thinking, resolve as resolve_thinking, ThinkingUnavailable
 
 HOST = "127.0.0.1"
 PORT = 8000
@@ -147,19 +146,18 @@ def validar_modelo(model):
     return model
 
 
-def resposta_com_modelo(message, model, effort="auto"):
+def resposta_com_modelo(message, model):
     if model == "auto":
-        return agent.chat(message, effort=effort)
+        return agent.chat(message)
     validar_modelo(model)
-    return agent.chat(message, modelo_resposta=model, effort=effort)
+    return agent.chat(message, modelo_resposta=model)
 
 
-def resposta_stream(message, model, on_chunk, effort="auto", on_state=None):
+def resposta_stream(message, model, on_chunk):
     if model == "auto":
-        return agent.chat(message, on_chunk=on_chunk, on_state=on_state, effort=effort)
+        return agent.chat(message, on_chunk=on_chunk)
     validar_modelo(model)
-    return agent.chat(message, modelo_resposta=model, on_chunk=on_chunk,
-                      on_state=on_state, effort=effort)
+    return agent.chat(message, modelo_resposta=model, on_chunk=on_chunk)
 
 
 def turno_editavel(item):
@@ -256,14 +254,6 @@ class LuciosWebHandler(BaseHTTPRequestHandler):
             except Exception:
                 self.send_json({"models": [], "available": False})
             return
-        if url.path == "/api/thinking":
-            model = parse_qs(url.query).get("model", ["auto"])[0]
-            try:
-                actual = agent.model_name if model == "auto" else validar_modelo(model)
-                self.send_json(describe_thinking(actual))
-            except (ThinkingUnavailable, ValueError, OSError) as error:
-                self.send_json({"error": str(error)}, 503)
-            return
         if url.path == "/api/conversation":
             try:
                 item = self.server.store.get(parse_qs(url.query).get("id", [None])[0])
@@ -303,31 +293,13 @@ class LuciosWebHandler(BaseHTTPRequestHandler):
         try:
             if self.path == "/api/new":
                 model = validar_modelo(payload.get("model", "auto"))
-                effort = payload.get("effort", "auto")
-                actual = agent.model_name if model == "auto" else model
-                try:
-                    resolve_thinking(actual, effort)
-                except ThinkingUnavailable as error:
-                    raise ChatActionError(str(error)) from error
-                self.send_json(publico(self.server.store.create(model, effort)))
+                self.send_json(publico(self.server.store.create(model)))
                 return
             if self.path == "/api/model":
                 model = validar_modelo(payload.get("model"))
                 with agent_lock:
                     self.server.store.set_model(payload.get("conversation_id"), model)
-                self.send_json({"model": model, "effort": "auto"})
-                return
-            if self.path == "/api/effort":
-                level = payload.get("effort")
-                with agent_lock:
-                    item = self.server.store.get(payload.get("conversation_id"))
-                    actual = agent.model_name if item["model"] == "auto" else item["model"]
-                    try:
-                        resolve_thinking(actual, level)
-                    except ThinkingUnavailable as error:
-                        raise ChatActionError(str(error), 400) from error
-                    self.server.store.set_effort(item["id"], level)
-                self.send_json({"effort": level})
+                self.send_json({"model": model})
                 return
             if self.path == "/api/delete":
                 identifier = payload.get("conversation_id")
@@ -388,8 +360,7 @@ class LuciosWebHandler(BaseHTTPRequestHandler):
                     success = agent.estado_encerramento != "falhou"
                     status = 200 if success else 502
                 else:
-                    reply = (resposta_com_modelo(message, conversation["model"],
-                                                conversation["effort"])
+                    reply = (resposta_com_modelo(message, conversation["model"])
                              if self.path == "/api/chat" and conversation is not None
                              else agent.chat(message if self.path == "/api/chat" else "limpar"))
                     state = agent.ultimo_resultado.estado
@@ -549,9 +520,7 @@ class LuciosWebHandler(BaseHTTPRequestHandler):
             try:
                 reply = resposta_stream(
                     message, conversation["model"],
-                    lambda part: send_event({"type": "delta", "text": part}),
-                    conversation["effort"],
-                    lambda state: send_event({"type": "state", "state": state}))
+                    lambda part: send_event({"type": "delta", "text": part}))
                 state = agent.ultimo_resultado.estado
                 if state != Estado.CONCLUIDO:
                     send_event({"type": "error", "message": reply})
@@ -602,8 +571,7 @@ class LuciosWebHandler(BaseHTTPRequestHandler):
             send_event = events.emit
             try:
                 reply = resposta_stream(
-                    text, item["model"], lambda part: send_event({"type": "delta", "text": part}),
-                    item["effort"], lambda state: send_event({"type": "state", "state": state}))
+                    text, item["model"], lambda part: send_event({"type": "delta", "text": part}))
                 state = agent.ultimo_resultado.estado
                 if state != Estado.CONCLUIDO:
                     agent.conversa = item["context"]

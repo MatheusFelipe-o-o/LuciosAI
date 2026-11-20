@@ -7,7 +7,6 @@ import ollama
 
 from memory import ARQUIVO_MEMORIA_PADRAO, Memory
 from orchestrator import Configuracao, Estado, Orquestrador, medir_etapa
-from thinking import resolve as resolve_thinking, chat as thinking_chat
 
 
 ESQUEMA_INTENCAO_MEMORIA = {
@@ -120,9 +119,7 @@ class LuciosAgent:
         self._cliente = cliente if cliente is not None else ollama.Client(
             host="http://127.0.0.1:11434", timeout=config.timeout
         )
-        self.orquestrador = Orquestrador(
-            config, lambda **kwargs: thinking_chat(self._cliente, **kwargs),
-            self._listar_modelos)
+        self.orquestrador = Orquestrador(config, self._cliente.chat, self._listar_modelos)
         self.ultimo_resultado = None
         self.medicoes_encerramento = []
         self.duracao_encerramento = 0
@@ -261,15 +258,14 @@ class LuciosAgent:
             return {"acao": "nenhuma", "consulta": ""}
         return {"acao": acao, "consulta": consulta.strip()}
 
-    def chat(self, user_input: str, cancelar=None, *, modelo_resposta=None,
-             on_chunk=None, on_state=None, effort="auto"):
+    def chat(self, user_input: str, cancelar=None, *, modelo_resposta=None, on_chunk=None):
         """Mantém a API textual das interfaces, delegando o fluxo ao orquestrador."""
         inicio_chat = time.perf_counter()
         resultado = self.orquestrador.executar(
             user_input,
             (lambda texto, modelo, contexto: self._responder(
-                texto, modelo, contexto, on_chunk, on_state, effort))
-            if on_chunk is not None or effort != "auto" else self._responder,
+                texto, modelo, contexto, on_chunk))
+            if on_chunk is not None else self._responder,
             self.clear_memory, cancelar,
             modelo_resposta=modelo_resposta
         )
@@ -289,8 +285,7 @@ class LuciosAgent:
         finally:
             resultado.duracao_chat = time.perf_counter() - inicio_chat
 
-    def _responder(self, user_input: str, modelo: str, contexto,
-                  on_chunk=None, on_state=None, effort="auto"):
+    def _responder(self, user_input: str, modelo: str, contexto, on_chunk=None):
         """Prepara memória e prompt; o resultado só entra na conversa após verificação."""
         with contexto.medir("classificacao_memoria"):
             intencao_memoria = self._classificar_pedido_memoria(user_input, contexto)
@@ -376,14 +371,13 @@ class LuciosAgent:
                 {"role": "user", "content": user_input},
             ]
 
-        inference = {"model": modelo, "messages": mensagens, "options": self.opcoes_modelo}
-        if effort != "auto":
-            inference["think"] = resolve_thinking(modelo, effort)
         if on_chunk is not None:
             return contexto.chamar_modelo_stream(
-                on_chunk, on_state=on_state, etapa="inferencia_resposta", **inference)
+                on_chunk, etapa="inferencia_resposta", model=modelo,
+                messages=mensagens, options=self.opcoes_modelo)
         response = contexto.chamar_modelo(
-            etapa="inferencia_resposta", **inference)
+            etapa="inferencia_resposta", model=modelo,
+            messages=mensagens, options=self.opcoes_modelo)
         with contexto.medir("leitura_resposta"):
             mensagem = _campo(response, "message", {})
             resposta = _campo(mensagem, "content", "") or ""

@@ -2,15 +2,7 @@
 const $ = (id) => document.getElementById(id);
 const token = document.querySelector('meta[name="lucios-token"]').content;
 let currentId = null, recent = [], busy = true, labBusy = false, toastTimer;
-let activeConversation = null, selectedModel = "auto", selectedEffort = "auto";
-let thinkingInfo = null, editing = false, defaultModel = "Modelo local";
-const thinkingCache = new Map();
-const effortLevels = [
-  ["light", "Light", "Leve e rápido, quando disponível"],
-  ["medium", "Medium", "Equilíbrio, quando disponível"],
-  ["high", "High", "Raciocínio ativado ou aprofundado"],
-  ["extra_high", "Extra High", "Máximo nativo, quando disponível"]
-];
+let activeConversation = null, selectedModel = "auto", editing = false, defaultModel = "Modelo local";
 let fileMode = false, pendingProposal = null, pendingSelection = null;
 const promptInput = $("prompt"), messages = $("messages");
 
@@ -65,7 +57,7 @@ function toast(text, url) {
 }
 function setBusy(value) {
   busy = value;
-  for (const id of ["sendBtn", "newBtn", "modelBtn", "effortBtn", "fileModeBtn"]) $(id).disabled = value;
+  for (const id of ["sendBtn", "newBtn", "modelBtn", "fileModeBtn"]) $(id).disabled = value;
   promptInput.disabled = value || editing || !!pendingProposal || !!pendingSelection;
   $("sendBtn").disabled = value || editing || !!pendingProposal || !!pendingSelection;
   $("endBtn").disabled = value || !currentId || !messages.children.length;
@@ -312,9 +304,6 @@ async function mutateTurn(path, extra = {}) {
         if (event.type === "delta") {
           if (!live) live = streamingMessage(assistantArticle);
           live.append(event.text);
-        } else if (event.type === "state") {
-          $("status").textContent = event.state === "thinking"
-            ? "Raciocinando no modelo…" : "Gerando resposta…";
         } else if (event.type === "done") completed = event.conversation;
       });
       if (!live) {
@@ -445,73 +434,6 @@ function updateModelLabel() {
   $("model").textContent = selectedModel === "auto" ? `Auto · ${defaultModel}` : selectedModel;
   $("model").title = $("modelBtn").title;
 }
-function updateEffortLabel() {
-  const found = effortLevels.find(item => item[0] === selectedEffort);
-  $("effortName").textContent = found ? found[1] : "Padrão";
-  $("effortBtn").title = thinkingInfo?.mode === "none"
-    ? "Este modelo não oferece controle de raciocínio"
-    : `Esforço: ${found ? found[1] : "padrão do modelo"}`;
-}
-function renderEffortOptions() {
-  const options = $("effortOptions"); options.replaceChildren();
-  const mode = thinkingInfo?.mode || "none";
-  $("effortInfo").textContent = mode === "named"
-    ? "Níveis nativos informados pelo Ollama."
-    : mode === "toggle"
-      ? "Este modelo só permite desligar ou ativar o raciocínio. Não controla a profundidade."
-      : "Este modelo não anuncia controle de raciocínio.";
-  for (const [key, label, description] of effortLevels) {
-    const enabled = !!thinkingInfo?.available?.[key];
-    const button = document.createElement("button"); button.type = "button";
-    button.className = "effort-option";
-    button.disabled = !enabled || busy;
-    button.setAttribute("aria-pressed", String(selectedEffort === key));
-    const title = document.createElement("strong"); title.textContent = label;
-    const detail = document.createElement("small");
-    detail.textContent = enabled ? description : "Indisponível neste modelo";
-    button.append(title, detail);
-    button.addEventListener("click", () => chooseEffort(key));
-    options.append(button);
-  }
-  $("effortAuto").disabled = busy;
-  updateEffortLabel();
-}
-async function loadThinkingCapabilities() {
-  const model = selectedModel;
-  if (thinkingCache.has(model)) {
-    thinkingInfo = thinkingCache.get(model); renderEffortOptions(); return;
-  }
-  try {
-    const info = await api(`/api/thinking?model=${encodeURIComponent(model)}`);
-    thinkingCache.set(model, info);
-    if (selectedModel === model) { thinkingInfo = info; renderEffortOptions(); }
-  } catch (error) {
-    if (selectedModel === model) {
-      thinkingInfo = null; renderEffortOptions();
-      $("effortInfo").textContent = "Não foi possível consultar o Ollama local.";
-    }
-  }
-}
-async function chooseEffort(level) {
-  if (busy || (level !== "auto" && !thinkingInfo?.available?.[level])) return;
-  if (currentId) {
-    try { await api("/api/effort", {conversation_id: currentId, effort: level}); }
-    catch (error) { toast(error.message); return; }
-  }
-  selectedEffort = level;
-  if (activeConversation) activeConversation.effort = level;
-  renderEffortOptions();
-  $("effortMenu").hidden = true;
-  $("effortBtn").setAttribute("aria-expanded", "false");
-}
-$("effortBtn").addEventListener("click", async () => {
-  if (busy) return;
-  const opening = $("effortMenu").hidden;
-  $("effortMenu").hidden = !opening;
-  $("effortBtn").setAttribute("aria-expanded", String(opening));
-  if (opening) await loadThinkingCapabilities();
-});
-$("effortAuto").addEventListener("click", () => chooseEffort("auto"));
 function closeModelMenu() {
   $("modelMenu").hidden = true;
   $("modelBtn").setAttribute("aria-expanded", "false");
@@ -534,11 +456,8 @@ function modelOption(name, caption) {
       finally { setBusy(false); renderRecent(); }
     }
     selectedModel = name;
-    selectedEffort = "auto";
     if (activeConversation) activeConversation.model = name;
-    if (activeConversation) activeConversation.effort = "auto";
     updateModelLabel();
-    thinkingInfo = null; updateEffortLabel(); loadThinkingCapabilities();
   });
   return button;
 }
@@ -575,8 +494,8 @@ async function openConversation(id) {
   try {
     const data = await api(`/api/conversation?id=${encodeURIComponent(id)}`);
     currentId = data.id; activeConversation = data;
-    selectedModel = data.model || "auto"; selectedEffort = data.effort || "auto";
-    updateModelLabel(); loadThinkingCapabilities();
+    selectedModel = data.model || "auto";
+    updateModelLabel();
     editing = false; renderConversation();
     pendingProposal = null; pendingSelection = null;
     const pending = await api(`/api/files/pending?conversation_id=${encodeURIComponent(id)}`);
@@ -592,8 +511,8 @@ async function openConversation(id) {
 function newChat() {
   if (busy) return;
   currentId = null; activeConversation = null; editing = false; pendingProposal = null; pendingSelection = null;
-  selectedModel = "auto"; selectedEffort = "auto";
-  updateModelLabel(); updateEffortLabel(); closeModelMenu();
+  selectedModel = "auto";
+  updateModelLabel(); closeModelMenu();
   messages.replaceChildren(); showWelcome(true);
   $("chatTitle").textContent = "Nova conversa"; promptInput.value = ""; resizeInput();
   setBusy(false); renderRecent();
@@ -613,16 +532,13 @@ $("chatForm").addEventListener("submit", async (event) => {
   promptInput.value = ""; resizeInput();
   try {
     if (!currentId) currentId = (await api("/api/new", {
-      model: selectedModel, effort: selectedEffort})).id;
+      model: selectedModel})).id;
     if (!fileMode) {
       let completed = null;
       await apiStream("/api/chat-stream", {message: text, conversation_id: currentId}, event => {
         if (event.type === "delta") {
           if (!partial) { pending.remove(); partial = streamingMessage(); }
           partial.append(event.text);
-        } else if (event.type === "state") {
-          $("status").textContent = event.state === "thinking"
-            ? "Raciocinando no modelo…" : "Gerando resposta…";
         } else if (event.type === "done") completed = event.conversation;
       });
       pending.remove();
@@ -692,10 +608,6 @@ document.addEventListener("keydown", (event) => {
   if (event.altKey && event.key.toLowerCase() === "n") { event.preventDefault(); newChat(); }
   if (event.key === "Escape") {
     if (!$("modelMenu").hidden) { closeModelMenu(); $("modelBtn").focus(); }
-    else if (!$("effortMenu").hidden) {
-      $("effortMenu").hidden = true; $("effortBtn").setAttribute("aria-expanded", "false");
-      $("effortBtn").focus();
-    }
     else { sidebar(false); $("menuBtn").focus(); }
   }
 });
@@ -731,5 +643,5 @@ $("labCard").addEventListener("click", openLab);
 setBusy(true); $("status").textContent = "Carregando seu espaço…";
 sidebar(!window.matchMedia("(max-width: 760px)").matches);
 refreshRecent().catch(error => toast(error.message)).finally(() => {
-  setBusy(false); renderRecent(); loadThinkingCapabilities(); promptInput.focus();
+  setBusy(false); renderRecent(); promptInput.focus();
 });
