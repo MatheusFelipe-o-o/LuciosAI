@@ -17,6 +17,7 @@ credentials.json
 
 # Local project notes and method configuration
 *.md
+!/README.md
 PROJECT_METHOD.yaml
 
 # Private runtime conversation data
